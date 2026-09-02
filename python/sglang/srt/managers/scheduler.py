@@ -276,7 +276,9 @@ from sglang.srt.mem_cache.common import (
 )
 from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
 from sglang.srt.model_loader.utils import get_resolved_model_impl
-from sglang.srt.multiplex.multiplexing_mixin import SchedulerMultiplexMixin
+from sglang.srt.multiplex.multiplexing_dispatch_mixin import (
+    SchedulerMultiplexDispatchMixin,
+)
 from sglang.srt.observability.metrics_collector import SchedulerMetricsCollector
 from sglang.srt.observability.req_time_stats import (
     flush_trace_batch,
@@ -383,7 +385,7 @@ _is_hip = is_hip()
 class Scheduler(
     SchedulerDisaggregationDecodeMixin,
     SchedulerDisaggregationPrefillMixin,
-    SchedulerMultiplexMixin,
+    SchedulerMultiplexDispatchMixin,
     SchedulerPPMixin,
     SchedulerDllmMixin,
     SchedulerMlxOverlapMixin,
