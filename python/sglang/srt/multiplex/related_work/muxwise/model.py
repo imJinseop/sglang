@@ -317,13 +317,34 @@ class MuxWiseProfile:
                 raise ValueError("duplicate phase regression for one SM count")
 
     @staticmethod
-    def _for_sm(models: Sequence[PhaseCoefficients], sm: int) -> PhaseCoefficients:
+    def _for_sm(
+        models: Sequence[PhaseCoefficients],
+        sm: int,
+        *,
+        allow_interpolation: bool = False,
+    ) -> PhaseCoefficients:
         for model in models:
             if model.sm == sm:
                 return model
+        ordered = sorted(models, key=lambda item: item.sm)
+        if allow_interpolation:
+            for lower, upper in zip(ordered, ordered[1:]):
+                if lower.sm < sm < upper.sm:
+                    fraction = (sm - lower.sm) / (upper.sm - lower.sm)
+                    theta = tuple(
+                        left + (right - left) * fraction
+                        for left, right in zip(lower.theta, upper.theta)
+                    )
+                    return PhaseCoefficients(
+                        phase=lower.phase,
+                        sm=sm,
+                        theta=theta,
+                        fit_samples=0,
+                        fit_mape=None,
+                    )
         raise ValueError(
             f"profile has no regression for sm={sm}; profile every pre-created "
-            "candidate rather than extrapolating to a new partition"
+            "candidate or enable interpolation between measured SM counts"
         )
 
     def estimate(
@@ -334,11 +355,20 @@ class MuxWiseProfile:
         prefill_new_tokens: Sequence[int],
         prefill_reused_tokens: Sequence[int],
         decode_context_tokens: Sequence[int],
+        allow_sm_interpolation: bool = False,
     ) -> MuxWiseEstimate:
         if prefill_sm + decode_sm != self.total_sm:
             raise ValueError("candidate SM counts do not match the fitted GPU")
-        prefill_model = self._for_sm(self.prefill_models, prefill_sm)
-        decode_model = self._for_sm(self.decode_models, decode_sm)
+        prefill_model = self._for_sm(
+            self.prefill_models,
+            prefill_sm,
+            allow_interpolation=allow_sm_interpolation,
+        )
+        decode_model = self._for_sm(
+            self.decode_models,
+            decode_sm,
+            allow_interpolation=allow_sm_interpolation,
+        )
         prefill_ms = prefill_model.predict_prefill_ms(
             prefill_new_tokens, prefill_reused_tokens
         )

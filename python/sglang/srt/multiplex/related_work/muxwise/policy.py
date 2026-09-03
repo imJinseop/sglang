@@ -68,6 +68,9 @@ class MuxWiseSLOPolicy:
         self._tbt_slo_ms = config.muxwise_tbt_slo_ms
         self._tbt_headroom = config.muxwise_tbt_headroom
         self._online_guard_update = config.muxwise_online_guard_update
+        self._allow_sm_interpolation = getattr(
+            config, "muxwise_allow_sm_interpolation", False
+        )
         self._plans = tuple(sm_counts[1:-1])
         if not self._plans:
             raise ValueError("MuxWise policy requires at least one paired partition")
@@ -78,8 +81,16 @@ class MuxWiseSLOPolicy:
         # Fail at startup, not under load, if the fitted profile misses a fixed
         # candidate that can be selected by the server.
         for prefill_sm, decode_sm in self._plans:
-            self._profile._for_sm(self._profile.prefill_models, prefill_sm)
-            self._profile._for_sm(self._profile.decode_models, decode_sm)
+            self._profile._for_sm(
+                self._profile.prefill_models,
+                prefill_sm,
+                allow_interpolation=self._allow_sm_interpolation,
+            )
+            self._profile._for_sm(
+                self._profile.decode_models,
+                decode_sm,
+                allow_interpolation=self._allow_sm_interpolation,
+            )
 
     @property
     def candidate_count(self) -> int:
@@ -108,6 +119,7 @@ class MuxWiseSLOPolicy:
                     prefill_new_tokens=prefill_new,
                     prefill_reused_tokens=prefill_reused,
                     decode_context_tokens=decode_context,
+                    allow_sm_interpolation=self._allow_sm_interpolation,
                 ),
             )
             for prefill_sm, decode_sm in self._plans

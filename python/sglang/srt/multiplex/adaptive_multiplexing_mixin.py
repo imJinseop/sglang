@@ -18,6 +18,7 @@ from torch.cuda.streams import ExternalStream
 from sglang.srt.distributed.parallel_state import set_pdmux_status
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.multiplex.pdmux_context import (
+    decode_execution_stream_idx,
     get_current_stream_idx,
     set_current_stream_idx,
 )
@@ -243,13 +244,16 @@ class SchedulerAdaptiveMultiplexMixin:
 
             self.ours_pdmux_policy = OursPDMuxPolicy(self.pdmux_config, self.sm_counts)
             logger.info(
-                "External energy-aware PDMux policy attached to %d fixed "
-                "partition candidates",
+                "Layerwise %s PDMux policy attached to %d fixed partition "
+                "candidates at %d MHz",
+                self.pdmux_config.ours_objective,
                 self.ours_pdmux_policy.candidate_count,
+                self.pdmux_config.ours_frequency_mhz,
             )
         self._trace_pdmux_event(
             "pdmux_initialized",
             policy=self.pdmux_config.partition_policy,
+            decode_graph_mode=self.pdmux_config.decode_graph_mode,
             repartition_interval_chunks=(self.pdmux_config.repartition_interval_chunks),
             split_forward_token_budget=(self.pdmux_config.split_forward_token_budget),
             partition_transition=self.pdmux_config.partition_transition,
@@ -308,6 +312,21 @@ class SchedulerAdaptiveMultiplexMixin:
                     "predicted_energy_j": selection.predicted_energy_j,
                     "predicted_power_w": selection.predicted_power_w,
                     "slo_satisfied": selection.slo_satisfied,
+                    "objective_score": selection.objective_score,
+                    "predicted_edp_j_s": selection.predicted_edp_j_s,
+                    "predicted_prefill_latency_ms": (
+                        selection.predicted_prefill_latency_ms
+                    ),
+                    "predicted_decode_latency_ms": (
+                        selection.predicted_decode_latency_ms
+                    ),
+                    "predicted_contention_factor": (
+                        selection.predicted_contention_factor
+                    ),
+                    "predicted_dram_bytes": selection.predicted_dram_bytes,
+                    "candidates_evaluated": selection.candidates_evaluated,
+                    "predicted_prefill_sm": selection.predicted_prefill_sm,
+                    "predicted_decode_sm": selection.predicted_decode_sm,
                     "selection_objective": self.pdmux_config.ours_objective,
                     "reason": selection.reason,
                     "decision_time_ms": decision.decision_time_ms,
@@ -556,11 +575,15 @@ class SchedulerAdaptiveMultiplexMixin:
             self._pdmux_active_bullet_decision = None
 
         changed = previous_stream_idx != stream_idx
+        decode_backend_idx = decode_execution_stream_idx(
+            self.pdmux_config, self.sm_counts, stream_idx
+        )
         self._pdmux_last_decision = {
             "trigger": trigger,
             "previous_stream_idx": previous_stream_idx,
             "selected_stream_idx": stream_idx,
             "changed": changed,
+            "effective_decode_sm": self.sm_counts[decode_backend_idx][1],
             **decision_fields,
         }
         self._trace_pdmux_event(
@@ -572,6 +595,7 @@ class SchedulerAdaptiveMultiplexMixin:
             changed=changed,
             prefill_sm=self.sm_counts[stream_idx][0],
             decode_sm=self.sm_counts[stream_idx][1],
+            effective_decode_sm=self.sm_counts[decode_backend_idx][1],
             chunk=self.pdmux_chunk_count,
             layer=(
                 self.split_prefill_batch.split_index
@@ -678,7 +702,10 @@ class SchedulerAdaptiveMultiplexMixin:
     ) -> tuple[ExternalStream, ExternalStream]:
         """Publish a selected group after its transition dependency is installed."""
         set_current_stream_idx(stream_idx)
-        self.tp_worker.model_runner.update_decode_attn_backend(stream_idx)
+        decode_backend_idx = decode_execution_stream_idx(
+            self.pdmux_config, self.sm_counts, stream_idx
+        )
+        self.tp_worker.model_runner.update_decode_attn_backend(decode_backend_idx)
         return self.stream_groups[stream_idx]
 
     def update_split_prefill_batch(

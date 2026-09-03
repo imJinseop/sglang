@@ -10,9 +10,18 @@ from sglang.srt.multiplex.adaptive_pdmux_config import (
     AdaptivePDMuxConfig,
     load_adaptive_pdmux_config,
 )
+from sglang.srt.multiplex.pdmux_context import (
+    apply_concurrency_mode,
+    decode_execution_stream_idx,
+    load_pdmux_config,
+    read_decode_graph_mode,
+)
 from sglang.srt.multiplex.multiplexing_dispatch_mixin import (
     SchedulerMultiplexDispatchMixin,
     SchedulerNativeMultiplexMixin,
+)
+from sglang.srt.model_executor.runner.decode_cuda_graph_runner import (
+    DecodeCudaGraphRunner,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -28,6 +37,112 @@ def _scheduler():
 
 
 class TestPDMuxRuntimeDispatch(CustomTestCase):
+    def test_single_graph_mode_uses_full_decode_backend_for_eager_fallback(self):
+        sm_counts = [(108, 0), (80, 28), (64, 44), (0, 108)]
+        config = SimpleNamespace(decode_graph_mode="full_sm_once")
+        self.assertEqual(decode_execution_stream_idx(config, sm_counts, 1), 3)
+        config.decode_graph_mode = "per_partition"
+        self.assertEqual(decode_execution_stream_idx(config, sm_counts, 1), 1)
+
+    def test_decode_capture_statistics_report_realized_graph_cardinality(self):
+        runner = object.__new__(DecodeCudaGraphRunner)
+        runner.backend = SimpleNamespace(
+            _graphs={index: object() for index in range(4)}
+        )
+        runner.enable_pdmux = True
+        runner.pdmux_decode_graph_mode = "full_sm_once"
+        runner.stream_groups = [(None, None)] * 8
+        runner.capture_bs = [1, 2, 4, 8]
+
+        stats = runner.capture_statistics()
+
+        self.assertEqual(stats["graph_artifact_count"], 4)
+        self.assertEqual(stats["capture_stream_count"], 1)
+        self.assertEqual(stats["batch_size_count"], 4)
+
+    def test_single_graph_mode_initializes_only_full_decode_graph_backend(self):
+        runner = object.__new__(DecodeCudaGraphRunner)
+        backends = [MagicMock() for _ in range(4)]
+        runner.enable_pdmux = True
+        runner.max_bs = 32
+        runner.max_num_token = 32
+        runner.model_runner = SimpleNamespace(
+            server_args=SimpleNamespace(pdmux_config_path="pdmux.yaml"),
+            decode_attn_backend_group=backends,
+        )
+        stream_groups = [(object(), object()) for _ in range(4)]
+        with (
+            patch(
+                "sglang.srt.model_executor.runner.decode_cuda_graph_runner.get_stream_groups",
+                return_value=stream_groups,
+            ),
+            patch(
+                "sglang.srt.model_executor.runner.decode_cuda_graph_runner.get_sm_counts",
+                return_value=[(108, 0), (80, 28), (64, 44), (0, 108)],
+            ),
+            patch(
+                "sglang.srt.model_executor.runner.decode_cuda_graph_runner.read_decode_graph_mode",
+                return_value="full_sm_once",
+            ),
+        ):
+            runner.maybe_init_pdmux()
+
+        for backend in backends[:-1]:
+            backend.init_cuda_graph_state.assert_not_called()
+        backends[-1].init_cuda_graph_state.assert_called_once_with(32, 32)
+
+    def test_fixed_80_28_concurrency_override_replaces_candidate_menu(self):
+        with patch.dict("os.environ", {"SGLANG_PDMUX_CONCURRENCY_MODE": "fixed_80_28"}):
+            raw = apply_concurrency_mode(
+                {"sm_group_num": 8, "manual_divisions": [[84, 24, 1]] * 6}
+            )
+        self.assertEqual(raw["sm_group_num"], 3)
+        self.assertEqual(raw["manual_divisions"], [[80, 28, 1]])
+        self.assertEqual(raw["decode_graph_mode"], "per_partition")
+        self.assertTrue(raw["muxwise_allow_sm_interpolation"])
+
+    def test_fixed_80_28_override_reaches_adaptive_config(self):
+        with tempfile.TemporaryDirectory() as directory:
+            config_path = Path(directory) / "pdmux.yaml"
+            config_path.write_text(
+                "\n".join(
+                    (
+                        "sm_group_num: 8",
+                        "runtime_mode: improved",
+                        "partition_policy: muxwise_slo",
+                        "manual_divisions:",
+                        "  - [92, 16, 1]",
+                        "  - [86, 22, 5]",
+                        "  - [78, 30, 10]",
+                        "  - [66, 42, 15]",
+                        "  - [52, 56, 20]",
+                        "  - [46, 62, 25]",
+                    )
+                ),
+                encoding="utf-8",
+            )
+            with patch.dict(
+                "os.environ", {"SGLANG_PDMUX_CONCURRENCY_MODE": "fixed_80_28"}
+            ):
+                config = load_adaptive_pdmux_config(str(config_path))
+
+        self.assertEqual(config.sm_group_num, 3)
+        self.assertEqual(config.manual_divisions, [[80, 28, 1]])
+        self.assertTrue(config.muxwise_allow_sm_interpolation)
+
+    def test_single_decode_graph_override_selects_full_sm_capture(self):
+        with tempfile.TemporaryDirectory() as directory:
+            config_path = Path(directory) / "pdmux.yaml"
+            config_path.write_text("sm_group_num: 3\n", encoding="utf-8")
+            with patch.dict(
+                "os.environ",
+                {"SGLANG_PDMUX_CONCURRENCY_MODE": "single_decode_graph"},
+            ):
+                mode = read_decode_graph_mode(str(config_path))
+                config = load_pdmux_config(str(config_path))
+        self.assertEqual(mode, "full_sm_once")
+        self.assertEqual(config.decode_graph_mode, "full_sm_once")
+
     def test_relative_artifact_paths_resolve_from_yaml_directory(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

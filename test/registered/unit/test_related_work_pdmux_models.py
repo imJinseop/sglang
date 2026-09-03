@@ -38,6 +38,17 @@ register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 
 class TestMuxWiseModel(CustomTestCase):
+    def test_fixed_80_28_can_interpolate_between_profiled_sm_counts(self):
+        models = (
+            PhaseCoefficients("prefill", 78, (0.0, 0.0, 1.0, 10.0)),
+            PhaseCoefficients("prefill", 86, (0.0, 0.0, 3.0, 30.0)),
+        )
+        interpolated = MuxWiseProfile._for_sm(models, 80, allow_interpolation=True)
+        self.assertEqual(interpolated.sm, 80)
+        self.assertEqual(interpolated.theta, (0.0, 0.0, 1.5, 15.0))
+        with self.assertRaisesRegex(ValueError, "enable interpolation"):
+            MuxWiseProfile._for_sm(models, 80)
+
     def test_paper_equations_and_runtime_max_guard(self):
         guard = ContentionGuard(
             prefill_new_boundaries=(2048,),

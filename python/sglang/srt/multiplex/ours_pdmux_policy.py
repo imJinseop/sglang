@@ -1,4 +1,4 @@
-"""Stable attachment boundary for an external energy-aware PDMux policy.
+"""Stable attachment boundary for the layerwise or an external PDMux policy.
 
 The external policy can only select an already-created stream-group index.  It
 cannot create a Green Context or introduce a new SM split at serving time.
@@ -30,6 +30,10 @@ class OursPolicyContext:
     objective: str
     tpot_slo_ms: float
     candidates: tuple[OursPolicyCandidate, ...]
+    model_artifact_path: str | None = None
+    frequency_mhz: int = 1410
+    allow_extrapolation: bool = True
+    hysteresis_fraction: float = 0.02
 
 
 @dataclass(frozen=True)
@@ -71,6 +75,15 @@ class OursPolicySelection:
     predicted_energy_j: float | None = None
     predicted_power_w: float | None = None
     slo_satisfied: bool | None = None
+    objective_score: float | None = None
+    predicted_edp_j_s: float | None = None
+    predicted_prefill_latency_ms: float | None = None
+    predicted_decode_latency_ms: float | None = None
+    predicted_contention_factor: float | None = None
+    predicted_dram_bytes: float | None = None
+    candidates_evaluated: int | None = None
+    predicted_prefill_sm: int | None = None
+    predicted_decode_sm: int | None = None
 
 
 @dataclass(frozen=True)
@@ -103,15 +116,25 @@ def _load_factory(entrypoint: str):
 
 
 class OursPDMuxPolicy:
-    """Validate and normalize decisions from the out-of-tree cost model."""
+    """Validate and normalize decisions from the configured cost model."""
 
     def __init__(
         self,
         config: AdaptivePDMuxConfig,
         sm_counts: list[tuple[int, int]],
     ) -> None:
+        total_sm = sum(sm_counts[1])
         candidates = tuple(
-            OursPolicyCandidate(index, prefill_sm, decode_sm)
+            OursPolicyCandidate(
+                index,
+                prefill_sm,
+                (
+                    total_sm
+                    if getattr(config, "decode_graph_mode", "per_partition")
+                    == "full_sm_once"
+                    else decode_sm
+                ),
+            )
             for index, (prefill_sm, decode_sm) in enumerate(sm_counts[1:-1], start=1)
         )
         if not candidates:
@@ -120,6 +143,10 @@ class OursPDMuxPolicy:
             objective=config.ours_objective,
             tpot_slo_ms=config.ours_tpot_slo_ms,
             candidates=candidates,
+            model_artifact_path=getattr(config, "ours_model_artifact_path", None),
+            frequency_mhz=getattr(config, "ours_frequency_mhz", 1410),
+            allow_extrapolation=getattr(config, "ours_allow_extrapolation", True),
+            hysteresis_fraction=getattr(config, "ours_hysteresis_fraction", 0.02),
         )
         self._candidate_indices = {item.stream_idx for item in candidates}
         self._split_forward_token_budget = config.split_forward_token_budget
@@ -129,9 +156,8 @@ class OursPDMuxPolicy:
         )
         if not entrypoint:
             raise ValueError(
-                "partition_policy='ours_energy' needs an external policy; set "
-                "--ours-policy-entrypoint module:factory (or "
-                "SGLANG_PDMUX_OURS_POLICY)"
+                "partition_policy='ours_energy' needs ours_policy_entrypoint "
+                "in its YAML or SGLANG_PDMUX_OURS_POLICY"
             )
         factory = _load_factory(entrypoint)
         self._policy = factory(self.context)

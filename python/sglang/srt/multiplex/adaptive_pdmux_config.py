@@ -14,7 +14,7 @@ from typing import Optional
 
 import yaml
 
-from sglang.srt.multiplex.pdmux_context import PDMuxConfig
+from sglang.srt.multiplex.pdmux_context import PDMuxConfig, apply_concurrency_mode
 
 
 @dataclass
@@ -46,11 +46,16 @@ class AdaptivePDMuxConfig(PDMuxConfig):
     muxwise_tbt_slo_ms: float = 50.0
     muxwise_tbt_headroom: float = 1.0
     muxwise_online_guard_update: bool = True
+    muxwise_allow_sm_interpolation: bool = False
     profile_fixed_stream_idx: int = 1
     profile_observation_path: Optional[str] = None
     profile_prefill_layers_per_step: int = 32
     ours_policy_entrypoint: Optional[str] = None
-    ours_objective: str = "energy"
+    ours_model_artifact_path: Optional[str] = None
+    ours_frequency_mhz: int = 1410
+    ours_allow_extrapolation: bool = True
+    ours_hysteresis_fraction: float = 0.02
+    ours_objective: str = "edp"
     ours_tpot_slo_ms: float = 10.0
 
 
@@ -59,7 +64,7 @@ def read_runtime_mode(config_path: str) -> str:
     if not config_path:
         return "native"
     with open(config_path, "r", encoding="utf-8") as file:
-        raw = yaml.safe_load(file) or {}
+        raw = apply_concurrency_mode(yaml.safe_load(file) or {})
     runtime_mode = raw.get("runtime_mode", "native")
     if runtime_mode not in {"native", "improved"}:
         raise ValueError("runtime_mode must be one of: native, improved")
@@ -72,7 +77,7 @@ def load_adaptive_pdmux_config(config_path: str) -> AdaptivePDMuxConfig:
         return AdaptivePDMuxConfig()
 
     with open(config_path, "r", encoding="utf-8") as file:
-        raw = yaml.safe_load(file) or {}
+        raw = apply_concurrency_mode(yaml.safe_load(file) or {})
     config_dir = Path(config_path).resolve().parent
 
     def resolve_config_path(value: Optional[str]) -> Optional[str]:
@@ -130,6 +135,12 @@ def load_adaptive_pdmux_config(config_path: str) -> AdaptivePDMuxConfig:
         raise ValueError(
             "partition_transition must be one of: host_sync_always, "
             "host_sync, event_handoff"
+        )
+
+    decode_graph_mode = raw.get("decode_graph_mode", "per_partition")
+    if decode_graph_mode not in {"per_partition", "full_sm_once"}:
+        raise ValueError(
+            "decode_graph_mode must be one of: per_partition, full_sm_once"
         )
 
     mi_objective = raw.get("mi_objective", "latency")
@@ -206,7 +217,7 @@ def load_adaptive_pdmux_config(config_path: str) -> AdaptivePDMuxConfig:
             "SGLANG_PDMUX_PROFILE_OBSERVATION_PATH"
         )
 
-    ours_objective = raw.get("ours_objective", "energy")
+    ours_objective = raw.get("ours_objective", "edp")
     if ours_objective not in {"latency", "energy", "edp"}:
         raise ValueError("ours_objective must be one of: latency, energy, edp")
     ours_tpot_slo_ms = float(
@@ -217,6 +228,17 @@ def load_adaptive_pdmux_config(config_path: str) -> AdaptivePDMuxConfig:
     )
     if ours_tpot_slo_ms <= 0:
         raise ValueError("ours_tpot_slo_ms must be > 0")
+    ours_frequency_mhz = int(
+        os.environ.get(
+            "SGLANG_PDMUX_OURS_FREQUENCY_MHZ",
+            raw.get("ours_frequency_mhz", 1410),
+        )
+    )
+    if ours_frequency_mhz <= 0:
+        raise ValueError("ours_frequency_mhz must be > 0")
+    ours_hysteresis_fraction = float(raw.get("ours_hysteresis_fraction", 0.02))
+    if not 0 <= ours_hysteresis_fraction < 1:
+        raise ValueError("ours_hysteresis_fraction must be in [0, 1)")
 
     return AdaptivePDMuxConfig(
         sm_group_num=raw["sm_group_num"],
@@ -227,6 +249,7 @@ def load_adaptive_pdmux_config(config_path: str) -> AdaptivePDMuxConfig:
         partition_policy=partition_policy,
         repartition_interval_chunks=repartition_interval_chunks,
         partition_transition=partition_transition,
+        decode_graph_mode=decode_graph_mode,
         mi_path=resolve_config_path(raw.get("mi_path")),
         mi_device_name=raw.get("mi_device_name", "NVIDIA_A100-PCIE-40GB"),
         mi_device_dir=resolve_config_path(raw.get("mi_device_dir")),
@@ -235,9 +258,7 @@ def load_adaptive_pdmux_config(config_path: str) -> AdaptivePDMuxConfig:
         mi_frequency_mhz=mi_frequency_mhz,
         mi_objective=mi_objective,
         mi_allow_modeled_throttling=raw.get("mi_allow_modeled_throttling", True),
-        bullet_srm_profile_path=resolve_config_path(
-            raw.get("bullet_srm_profile_path")
-        ),
+        bullet_srm_profile_path=resolve_config_path(raw.get("bullet_srm_profile_path")),
         bullet_device_name=raw.get("bullet_device_name", "NVIDIA_A100-PCIE-40GB"),
         bullet_device_dir=resolve_config_path(raw.get("bullet_device_dir")),
         bullet_workload_model=raw.get("bullet_workload_model", "llama3_8b"),
@@ -252,10 +273,17 @@ def load_adaptive_pdmux_config(config_path: str) -> AdaptivePDMuxConfig:
         muxwise_tbt_slo_ms=muxwise_tbt_slo_ms,
         muxwise_tbt_headroom=muxwise_tbt_headroom,
         muxwise_online_guard_update=raw.get("muxwise_online_guard_update", True),
+        muxwise_allow_sm_interpolation=raw.get("muxwise_allow_sm_interpolation", False),
         profile_fixed_stream_idx=profile_fixed_stream_idx,
         profile_observation_path=profile_observation_path,
         profile_prefill_layers_per_step=profile_prefill_layers_per_step,
         ours_policy_entrypoint=raw.get("ours_policy_entrypoint"),
+        ours_model_artifact_path=resolve_config_path(
+            raw.get("ours_model_artifact_path")
+        ),
+        ours_frequency_mhz=ours_frequency_mhz,
+        ours_allow_extrapolation=raw.get("ours_allow_extrapolation", True),
+        ours_hysteresis_fraction=ours_hysteresis_fraction,
         ours_objective=ours_objective,
         ours_tpot_slo_ms=ours_tpot_slo_ms,
     )

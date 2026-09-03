@@ -1,4 +1,4 @@
-"""CPU-only contract tests for the external energy-aware policy port."""
+"""CPU-only contracts for the built-in layerwise/external policy boundary."""
 
 import unittest
 from types import SimpleNamespace
@@ -22,6 +22,7 @@ def _config():
         ours_tpot_slo_ms=12.5,
         ours_policy_entrypoint="test_policy:factory",
         split_forward_token_budget=4096,
+        decode_graph_mode="per_partition",
     )
 
 
@@ -56,6 +57,19 @@ class _FixedPolicy:
 
 
 class TestOursPDMuxPolicy(CustomTestCase):
+    def test_single_graph_context_exposes_full_sm_decode_for_every_candidate(self):
+        config = _config()
+        config.decode_graph_mode = "full_sm_once"
+        with patch(
+            "sglang.srt.multiplex.ours_pdmux_policy._load_factory",
+            return_value=lambda context: _FixedPolicy(context, 1),
+        ):
+            policy = OursPDMuxPolicy(config, [(108, 0), (84, 24), (68, 40), (0, 108)])
+        self.assertEqual(
+            [candidate.decode_sm for candidate in policy.context.candidates],
+            [108, 108],
+        )
+
     def test_context_exposes_only_precreated_paired_candidates(self):
         with patch(
             "sglang.srt.multiplex.ours_pdmux_policy._load_factory",

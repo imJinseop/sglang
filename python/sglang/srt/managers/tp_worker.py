@@ -115,6 +115,31 @@ class BaseTpWorker(ABC):
         return merge_graph_time_usage(*(runner.graph_time_usage for runner in runners))
 
     @property
+    def graph_capture_statistics(self) -> dict:
+        """Aggregate realized decode CUDA-graph counts across model runners."""
+        runners = self.model_runner_list or [self.model_runner]
+        per_runner = []
+        for runner in runners:
+            decode_runner = getattr(runner, "decode_cuda_graph_runner", None)
+            if decode_runner is None or not hasattr(
+                decode_runner, "capture_statistics"
+            ):
+                continue
+            per_runner.append(decode_runner.capture_statistics())
+        return {
+            "decode_graph_artifact_count": sum(
+                int(item["graph_artifact_count"]) for item in per_runner
+            ),
+            "decode_capture_stream_count": sum(
+                int(item["capture_stream_count"]) for item in per_runner
+            ),
+            "decode_capture_batch_size_count": sum(
+                int(item["batch_size_count"]) for item in per_runner
+            ),
+            "model_runners": per_runner,
+        }
+
+    @property
     def weight_load_time(self) -> float:
         runners = self.model_runner_list or [self.model_runner]
         return sum(runner.weight_load_time for runner in runners)
