@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import sys
 import time
+import logging
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
@@ -11,6 +12,9 @@ from sglang.srt.multiplex.policy_state import PDMuxPolicyInput
 
 if TYPE_CHECKING:
     from sglang.srt.multiplex.adaptive_pdmux_config import AdaptivePDMuxConfig
+
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -49,6 +53,9 @@ class MIPDMuxPolicy:
         self,
         config: AdaptivePDMuxConfig,
         sm_counts: list[tuple[int, int]],
+        *,
+        model_config,
+        page_size: int,
     ) -> None:
         if config.mi_path and config.mi_path not in sys.path:
             sys.path.insert(0, config.mi_path)
@@ -59,22 +66,45 @@ class MIPDMuxPolicy:
                 ExecutionPlan,
                 ExecutionState,
                 MICostModelPredictor,
+                MISGLangRuntimePredictor,
                 Objective,
                 ScheduleConstraints,
                 build_llm_layer_work,
             )
+            from modeling.cost_model.workload import get_model_spec
         except ImportError as exc:
             location = config.mi_path or "the current Python path"
             raise ImportError(
-                "partition_policy='mi_cost_model' requires the MI repository; "
+                "partition_policy='mi' requires the MI repository; "
                 f"could not import bullet_green from {location}"
             ) from exc
 
-        predictor = MICostModelPredictor.from_device_name(
-            config.mi_device_name,
-            device_dir=config.mi_device_dir,
-            dtype=config.mi_dtype,
-        )
+        try:
+            predictor = MISGLangRuntimePredictor.from_device_name(
+                config.mi_device_name,
+                model_config=model_config,
+                page_size=page_size,
+                device_dir=config.mi_device_dir,
+                dtype=config.mi_dtype,
+                allow_extrapolation=config.mi_allow_extrapolation,
+            )
+            logger.info(
+                "MI is using fitted actual SGLang runtime kernels from "
+                "device calibration"
+            )
+        except FileNotFoundError:
+            predictor = MICostModelPredictor.from_device_name(
+                config.mi_device_name,
+                device_dir=config.mi_device_dir,
+                dtype=config.mi_dtype,
+            )
+            logger.warning(
+                "MI SGLang runtime fit is absent for device=%s dtype=%s; "
+                "using the provisional physical primitive model until the "
+                "runtime-kernel calibration is fitted",
+                config.mi_device_name,
+                config.mi_dtype,
+            )
         if predictor.total_sm != sum(sm_counts[1]):
             raise ValueError(
                 "MI device profile and PDMux GPU disagree on total SM count: "
@@ -92,7 +122,10 @@ class MIPDMuxPolicy:
 
         self._ExecutionState = ExecutionState
         self._build_llm_layer_work = build_llm_layer_work
-        self._model = config.mi_workload_model
+        # Model dimensions come from the exact Hugging Face config SGLang has
+        # already loaded for ``model_path``. Device terms remain exclusively in
+        # device/<device>/calibration.json.
+        self._model = get_model_spec(model_config)
         self._dtype = config.mi_dtype
         self._frequency_mhz = frequency_mhz
         self._split_forward_token_budget = config.split_forward_token_budget
@@ -150,6 +183,8 @@ class MIPDMuxPolicy:
             decode_batch=decode.batch_size,
             decode_context_tokens=decode.context_tokens,
             remaining_layers=remaining_layers,
+            prefill_layers_in_quantum=prefill_layers,
+            decode_layers_in_quantum=total_layers,
         )
         layer_work = self._build_llm_layer_work(
             state,

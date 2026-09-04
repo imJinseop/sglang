@@ -17,12 +17,12 @@ def build_phase_layer_work(
     phase: str,
     state: ExecutionState,
     *,
-    model: str = "llama3_8b",
+    model="meta-llama/Llama-3.1-8B-Instruct",
     dtype: str = "bf16",
 ) -> LaneWork:
     """Build one phase's per-kernel work even when the other lane is idle."""
 
-    from modeling.cost_model.workload import build_llm_workload, get_model_spec
+    from modeling.cost_model.workload import build_llm_workload
 
     if phase == "prefill":
         if state.prefill_tokens <= 0 or state.prefill_batch <= 0:
@@ -38,7 +38,6 @@ def build_phase_layer_work(
         output_tokens = 1
     else:
         raise ValueError("phase must be 'prefill' or 'decode'")
-    spec = get_model_spec(model)
     workload = build_llm_workload(
         model=model,
         component="layer",
@@ -48,22 +47,21 @@ def build_phase_layer_work(
         dtype=dtype,
         batch_size=batch_size,
     )
-    return LaneWork.from_workload(workload).scaled(1 / spec.num_layers)
+    return LaneWork.from_workload(workload)
 
 
 def build_llm_layer_work(
     state: ExecutionState,
     *,
-    model: str = "llama3_8b",
+    model="meta-llama/Llama-3.1-8B-Instruct",
     dtype: str = "bf16",
 ) -> BulletLaneWorkPair:
     """Return per-kernel work for one Transformer layer in each lane.
 
-    MI's workload builder emits work for all model layers. Dividing every
-    kernel by the model layer count gives the unit that Bullet's layer-wise
-    controller can multiply by its next prefill quantum or by a full decode
-    iteration. MI supplies kernel work only; the SRM and scheduling rule remain
-    independent related-work implementations in this package.
+    MI's workload builder reads the serving model config and emits one layer,
+    which Bullet's controller multiplies by its next prefill quantum or a full
+    decode iteration. MI supplies kernel work only; the SRM and scheduling rule
+    remain independent related-work implementations in this package.
     """
 
     if state.prefill_tokens <= 0 or state.decode_batch <= 0:

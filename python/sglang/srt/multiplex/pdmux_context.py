@@ -1,4 +1,5 @@
 from dataclasses import dataclass, field
+import json
 import os
 from typing import List
 
@@ -25,7 +26,7 @@ class PDMuxConfig:
 
 PDMUX_CONCURRENCY_MODES = {
     "per_partition",
-    "fixed_80_28",
+    "fixed_partition",
     "single_decode_graph",
 }
 
@@ -33,15 +34,33 @@ PDMUX_CONCURRENCY_MODES = {
 def apply_concurrency_mode(raw: dict) -> dict:
     """Apply the benchmark's process-wide concurrency ablation override."""
     result = dict(raw)
+    manual_override = os.environ.get("SGLANG_PDMUX_MANUAL_DIVISIONS")
+    if manual_override:
+        manual_divisions = json.loads(manual_override)
+        if not isinstance(manual_divisions, list) or not manual_divisions:
+            raise ValueError("SGLANG_PDMUX_MANUAL_DIVISIONS must be a non-empty JSON list")
+        result["manual_divisions"] = manual_divisions
+        result["sm_group_num"] = len(manual_divisions) + 2
     mode = os.environ.get("SGLANG_PDMUX_CONCURRENCY_MODE", "per_partition")
     if mode not in PDMUX_CONCURRENCY_MODES:
         raise ValueError(
             "SGLANG_PDMUX_CONCURRENCY_MODE must be one of: "
             + ", ".join(sorted(PDMUX_CONCURRENCY_MODES))
         )
-    if mode == "fixed_80_28":
+    if mode == "fixed_partition":
+        raw_division = os.environ.get("SGLANG_PDMUX_FIXED_DIVISION", "")
+        try:
+            prefill_sm, decode_sm = (
+                int(value.strip()) for value in raw_division.split(",", 1)
+            )
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                "fixed_partition requires SGLANG_PDMUX_FIXED_DIVISION=PREFILL,DECODE"
+            ) from exc
+        if prefill_sm <= 0 or decode_sm <= 0:
+            raise ValueError("fixed partition SM counts must be positive")
         result["sm_group_num"] = 3
-        result["manual_divisions"] = [[80, 28, 1]]
+        result["manual_divisions"] = [[prefill_sm, decode_sm, 1]]
         result["decode_graph_mode"] = "per_partition"
         result["muxwise_allow_sm_interpolation"] = True
     elif mode == "single_decode_graph":

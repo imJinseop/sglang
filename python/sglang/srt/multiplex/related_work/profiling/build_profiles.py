@@ -7,6 +7,8 @@ import json
 import sys
 from collections import Counter
 from pathlib import Path
+
+from utils.experiment_env import device_max_graphics_clock_mhz, env_device_name
 from typing import Mapping
 
 from ..bullet.fit_profile import fit_profile as fit_bullet_profile
@@ -149,13 +151,26 @@ def main() -> None:
     parser.add_argument("--muxwise-output", type=Path)
     parser.add_argument("--bullet-output", type=Path)
     parser.add_argument("--summary-output", type=Path)
-    parser.add_argument("--mi-path", default="/root/mi")
-    parser.add_argument("--model", default="llama3_8b")
+    parser.add_argument("--mi-path", default=str(Path.cwd()))
+    parser.add_argument(
+        "--model-path",
+        required=True,
+        help="model directory, config.json path, or locally cached HF model ID",
+    )
     parser.add_argument("--dtype", default="bf16")
-    parser.add_argument("--device", default="NVIDIA_A100-PCIE-40GB")
-    parser.add_argument("--frequency-mhz", type=int, default=1410)
-    parser.add_argument("--total-sm", type=int, default=108)
+    parser.add_argument("--device", default=env_device_name())
+    parser.add_argument(
+        "--frequency-mhz",
+        type=int,
+        default=device_max_graphics_clock_mhz(),
+        help="defaults to the GPU selected by .env DEVICE_INDEX",
+    )
+    parser.add_argument("--total-sm", type=int)
     args = parser.parse_args()
+    if args.total_sm is None:
+        from device import Device
+
+        args.total_sm = int(Device.load(args.device).specification.num_sm)
     fit_muxwise = args.target in {"both", "muxwise"}
     fit_bullet = args.target in {"both", "bullet"}
     if fit_muxwise and args.muxwise_output is None:
@@ -180,7 +195,7 @@ def main() -> None:
         mux_rows = muxwise_rows(observations)
         mux_profile = fit_muxwise_profile(
             mux_rows,
-            model=args.model,
+            model=args.model_path,
             device=args.device,
             total_sm=args.total_sm,
         )
@@ -203,7 +218,7 @@ def main() -> None:
     if fit_bullet:
         bullet_input = bullet_rows(
             observations,
-            model=args.model,
+            model=args.model_path,
             dtype=args.dtype,
             frequency_mhz=args.frequency_mhz,
         )

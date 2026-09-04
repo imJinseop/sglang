@@ -91,8 +91,14 @@ class TestPDMuxRuntimeDispatch(CustomTestCase):
             backend.init_cuda_graph_state.assert_not_called()
         backends[-1].init_cuda_graph_state.assert_called_once_with(32, 32)
 
-    def test_fixed_80_28_concurrency_override_replaces_candidate_menu(self):
-        with patch.dict("os.environ", {"SGLANG_PDMUX_CONCURRENCY_MODE": "fixed_80_28"}):
+    def test_fixed_partition_concurrency_override_replaces_candidate_menu(self):
+        with patch.dict(
+            "os.environ",
+            {
+                "SGLANG_PDMUX_CONCURRENCY_MODE": "fixed_partition",
+                "SGLANG_PDMUX_FIXED_DIVISION": "80,28",
+            },
+        ):
             raw = apply_concurrency_mode(
                 {"sm_group_num": 8, "manual_divisions": [[84, 24, 1]] * 6}
             )
@@ -101,7 +107,7 @@ class TestPDMuxRuntimeDispatch(CustomTestCase):
         self.assertEqual(raw["decode_graph_mode"], "per_partition")
         self.assertTrue(raw["muxwise_allow_sm_interpolation"])
 
-    def test_fixed_80_28_override_reaches_adaptive_config(self):
+    def test_fixed_partition_override_reaches_adaptive_config(self):
         with tempfile.TemporaryDirectory() as directory:
             config_path = Path(directory) / "pdmux.yaml"
             config_path.write_text(
@@ -122,7 +128,11 @@ class TestPDMuxRuntimeDispatch(CustomTestCase):
                 encoding="utf-8",
             )
             with patch.dict(
-                "os.environ", {"SGLANG_PDMUX_CONCURRENCY_MODE": "fixed_80_28"}
+                "os.environ",
+                {
+                    "SGLANG_PDMUX_CONCURRENCY_MODE": "fixed_partition",
+                    "SGLANG_PDMUX_FIXED_DIVISION": "80,28",
+                },
             ):
                 config = load_adaptive_pdmux_config(str(config_path))
 
@@ -155,6 +165,7 @@ class TestPDMuxRuntimeDispatch(CustomTestCase):
                         "partition_policy: bullet_srm_tpot",
                         "mi_path: ../mi",
                         "bullet_srm_profile_path: profiles/bullet.json",
+                        "bullet_reference_frequency_mhz: 1234",
                     )
                 ),
                 encoding="utf-8",

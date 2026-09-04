@@ -175,11 +175,15 @@ class SchedulerAdaptiveMultiplexMixin:
         self.mi_pdmux_policy = None
         self.bullet_pdmux_policy = None
         self.muxwise_slo_policy = None
-        self.ours_pdmux_policy = None
-        if self.pdmux_config.partition_policy == "mi_cost_model":
+        if self.pdmux_config.partition_policy == "mi":
             from sglang.srt.multiplex.mi_pdmux_policy import MIPDMuxPolicy
 
-            self.mi_pdmux_policy = MIPDMuxPolicy(self.pdmux_config, self.sm_counts)
+            self.mi_pdmux_policy = MIPDMuxPolicy(
+                self.pdmux_config,
+                self.sm_counts,
+                model_config=self.model_config.hf_text_config,
+                page_size=self.page_size,
+            )
             logger.info(
                 "MI PDMux policy initialized with %d pre-created partition "
                 "candidates at %d MHz",
@@ -192,7 +196,9 @@ class SchedulerAdaptiveMultiplexMixin:
             )
 
             self.bullet_pdmux_policy = BulletSRMTPOTPolicy(
-                self.pdmux_config, self.sm_counts
+                self.pdmux_config,
+                self.sm_counts,
+                model_config=self.model_config.hf_text_config,
             )
             logger.info(
                 "Bullet SRM TPOT policy initialized with %d fixed partition "
@@ -238,17 +244,6 @@ class SchedulerAdaptiveMultiplexMixin:
                 self.sm_counts[stream_idx][1],
                 self.pdmux_config.profile_prefill_layers_per_step,
                 self.pdmux_config.profile_observation_path,
-            )
-        elif self.pdmux_config.partition_policy == "ours_energy":
-            from sglang.srt.multiplex.ours_pdmux_policy import OursPDMuxPolicy
-
-            self.ours_pdmux_policy = OursPDMuxPolicy(self.pdmux_config, self.sm_counts)
-            logger.info(
-                "Layerwise %s PDMux policy attached to %d fixed partition "
-                "candidates at %d MHz",
-                self.pdmux_config.ours_objective,
-                self.ours_pdmux_policy.candidate_count,
-                self.pdmux_config.ours_frequency_mhz,
             )
         self._trace_pdmux_event(
             "pdmux_initialized",
@@ -301,65 +296,7 @@ class SchedulerAdaptiveMultiplexMixin:
                 current_stream_idx=previous_stream_idx,
                 trigger=trigger,
             )
-            if self.ours_pdmux_policy is not None:
-                decision = self.ours_pdmux_policy.select(policy_input)
-                selection = decision.selection
-                state = decision.state
-                stream_idx = selection.stream_idx
-                selected_prefill_layers = state.prefill_layers_in_quantum
-                decision_fields = {
-                    "predicted_latency_ms": selection.predicted_latency_ms,
-                    "predicted_energy_j": selection.predicted_energy_j,
-                    "predicted_power_w": selection.predicted_power_w,
-                    "slo_satisfied": selection.slo_satisfied,
-                    "objective_score": selection.objective_score,
-                    "predicted_edp_j_s": selection.predicted_edp_j_s,
-                    "predicted_prefill_latency_ms": (
-                        selection.predicted_prefill_latency_ms
-                    ),
-                    "predicted_decode_latency_ms": (
-                        selection.predicted_decode_latency_ms
-                    ),
-                    "predicted_contention_factor": (
-                        selection.predicted_contention_factor
-                    ),
-                    "predicted_dram_bytes": selection.predicted_dram_bytes,
-                    "candidates_evaluated": selection.candidates_evaluated,
-                    "predicted_prefill_sm": selection.predicted_prefill_sm,
-                    "predicted_decode_sm": selection.predicted_decode_sm,
-                    "selection_objective": self.pdmux_config.ours_objective,
-                    "reason": selection.reason,
-                    "decision_time_ms": decision.decision_time_ms,
-                    "prefill_tokens": state.prefill_tokens,
-                    "decode_batch": state.decode_batch,
-                    "decode_context_tokens": state.decode_context_tokens,
-                    "remaining_layers": state.remaining_layers,
-                    "prefill_layers": state.prefill_layers_in_quantum,
-                    "decode_layers": state.decode_layers_in_quantum,
-                }
-                logger.info(
-                    "Ours PDMux decision: chunk=%d layer=%d remaining=%d "
-                    "state=(prefill_tokens=%d,decode_bs=%d,"
-                    "decode_context_tokens=%d) stream=%d sm=(P%d,D%d) "
-                    "predicted=(latency=%s,energy=%s,power=%s) objective=%s "
-                    "reason=%s decision=%.3fms",
-                    self.pdmux_chunk_count,
-                    self.split_prefill_batch.split_index,
-                    state.remaining_layers,
-                    state.prefill_tokens,
-                    state.decode_batch,
-                    state.decode_context_tokens,
-                    stream_idx,
-                    self.sm_counts[stream_idx][0],
-                    self.sm_counts[stream_idx][1],
-                    selection.predicted_latency_ms,
-                    selection.predicted_energy_j,
-                    selection.predicted_power_w,
-                    self.pdmux_config.ours_objective,
-                    selection.reason,
-                    decision.decision_time_ms,
-                )
-            elif self.muxwise_slo_policy is not None:
+            if self.muxwise_slo_policy is not None:
                 decision = self.muxwise_slo_policy.select(policy_input)
                 stream_idx = decision.stream_idx
                 selected_prefill_layers = decision.prefill_layers

@@ -28,6 +28,8 @@ from typing import Iterable, Mapping, Sequence
 
 import numpy as np
 
+from utils.experiment_env import env_device_name
+
 from .model import (
     ContentionGuard,
     GuardCell,
@@ -278,10 +280,14 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--observations", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
-    parser.add_argument("--model", default="llama3_8b")
-    parser.add_argument("--device", default="NVIDIA_A100-PCIE-40GB")
-    parser.add_argument("--total-sm", type=int, default=108)
+    parser.add_argument("--model", default="meta-llama/Llama-3.1-8B-Instruct")
+    parser.add_argument("--device", default=env_device_name())
+    parser.add_argument("--total-sm", type=int)
     args = parser.parse_args()
+    if args.total_sm is None:
+        from device import Device
+
+        args.total_sm = int(Device.load(args.device).specification.num_sm)
     profile = fit_profile(
         _load_jsonl(args.observations),
         model=args.model,

@@ -24,19 +24,18 @@ class AdaptivePDMuxConfig(PDMuxConfig):
     repartition_interval_chunks: int = 0
     partition_transition: str = "host_sync_always"
     mi_path: Optional[str] = None
-    mi_device_name: str = "NVIDIA_A100-PCIE-40GB"
+    mi_device_name: str = ""
     mi_device_dir: Optional[str] = None
-    mi_workload_model: str = "llama3_8b"
     mi_dtype: str = "bf16"
     mi_frequency_mhz: Optional[int] = None
     mi_objective: str = "latency"
     mi_allow_modeled_throttling: bool = True
+    mi_allow_extrapolation: bool = True
     bullet_srm_profile_path: Optional[str] = None
-    bullet_device_name: str = "NVIDIA_A100-PCIE-40GB"
+    bullet_device_name: str = ""
     bullet_device_dir: Optional[str] = None
-    bullet_workload_model: str = "llama3_8b"
     bullet_dtype: str = "bf16"
-    bullet_reference_frequency_mhz: int = 1410
+    bullet_reference_frequency_mhz: Optional[int] = None
     bullet_tpot_slo_ms: float = 10.0
     bullet_tpot_headroom: float = 1.0
     bullet_prefill_layers_per_step: int = 1
@@ -50,13 +49,6 @@ class AdaptivePDMuxConfig(PDMuxConfig):
     profile_fixed_stream_idx: int = 1
     profile_observation_path: Optional[str] = None
     profile_prefill_layers_per_step: int = 32
-    ours_policy_entrypoint: Optional[str] = None
-    ours_model_artifact_path: Optional[str] = None
-    ours_frequency_mhz: int = 1410
-    ours_allow_extrapolation: bool = True
-    ours_hysteresis_fraction: float = 0.02
-    ours_objective: str = "edp"
-    ours_tpot_slo_ms: float = 10.0
 
 
 def read_runtime_mode(config_path: str) -> str:
@@ -108,10 +100,9 @@ def load_adaptive_pdmux_config(config_path: str) -> AdaptivePDMuxConfig:
         "decode_bs",
         "muxwise_artifact",
         "muxwise_slo",
-        "mi_cost_model",
+        "mi",
         "bullet_srm_tpot",
         "offline_profile",
-        "ours_energy",
     }
     if partition_policy not in valid_policies:
         raise ValueError(
@@ -146,14 +137,27 @@ def load_adaptive_pdmux_config(config_path: str) -> AdaptivePDMuxConfig:
     mi_objective = raw.get("mi_objective", "latency")
     if mi_objective not in {"latency", "energy", "edp"}:
         raise ValueError("mi_objective must be one of: latency, energy, edp")
-    mi_frequency_mhz = raw.get("mi_frequency_mhz")
+    mi_frequency_value = os.environ.get(
+        "SGLANG_PDMUX_MI_FREQUENCY_MHZ", raw.get("mi_frequency_mhz")
+    )
+    mi_frequency_mhz = (
+        None if mi_frequency_value is None else int(mi_frequency_value)
+    )
     if mi_frequency_mhz is not None and mi_frequency_mhz <= 0:
         raise ValueError("mi_frequency_mhz must be > 0")
 
-    bullet_reference_frequency_mhz = int(
-        raw.get("bullet_reference_frequency_mhz", 1410)
+    bullet_frequency_value = os.environ.get(
+        "SGLANG_PDMUX_BULLET_FREQUENCY_MHZ",
+        raw.get("bullet_reference_frequency_mhz"),
     )
-    if bullet_reference_frequency_mhz <= 0:
+    bullet_reference_frequency_mhz = (
+        None if bullet_frequency_value is None else int(bullet_frequency_value)
+    )
+    if partition_policy == "bullet_srm_tpot" and bullet_reference_frequency_mhz is None:
+        raise ValueError(
+            "bullet_srm_tpot requires a device-derived reference frequency"
+        )
+    if bullet_reference_frequency_mhz is not None and bullet_reference_frequency_mhz <= 0:
         raise ValueError("bullet_reference_frequency_mhz must be > 0")
     bullet_tpot_slo_ms = float(
         os.environ.get(
@@ -217,29 +221,6 @@ def load_adaptive_pdmux_config(config_path: str) -> AdaptivePDMuxConfig:
             "SGLANG_PDMUX_PROFILE_OBSERVATION_PATH"
         )
 
-    ours_objective = raw.get("ours_objective", "edp")
-    if ours_objective not in {"latency", "energy", "edp"}:
-        raise ValueError("ours_objective must be one of: latency, energy, edp")
-    ours_tpot_slo_ms = float(
-        os.environ.get(
-            "SGLANG_PDMUX_OURS_TPOT_SLO_MS",
-            raw.get("ours_tpot_slo_ms", 10.0),
-        )
-    )
-    if ours_tpot_slo_ms <= 0:
-        raise ValueError("ours_tpot_slo_ms must be > 0")
-    ours_frequency_mhz = int(
-        os.environ.get(
-            "SGLANG_PDMUX_OURS_FREQUENCY_MHZ",
-            raw.get("ours_frequency_mhz", 1410),
-        )
-    )
-    if ours_frequency_mhz <= 0:
-        raise ValueError("ours_frequency_mhz must be > 0")
-    ours_hysteresis_fraction = float(raw.get("ours_hysteresis_fraction", 0.02))
-    if not 0 <= ours_hysteresis_fraction < 1:
-        raise ValueError("ours_hysteresis_fraction must be in [0, 1)")
-
     return AdaptivePDMuxConfig(
         sm_group_num=raw["sm_group_num"],
         manual_divisions=manual_divisions,
@@ -250,26 +231,46 @@ def load_adaptive_pdmux_config(config_path: str) -> AdaptivePDMuxConfig:
         repartition_interval_chunks=repartition_interval_chunks,
         partition_transition=partition_transition,
         decode_graph_mode=decode_graph_mode,
-        mi_path=resolve_config_path(raw.get("mi_path")),
-        mi_device_name=raw.get("mi_device_name", "NVIDIA_A100-PCIE-40GB"),
+        mi_path=resolve_config_path(
+            os.environ.get("SGLANG_PDMUX_MI_PATH", raw.get("mi_path"))
+        ),
+        mi_device_name=os.environ.get(
+            "SGLANG_PDMUX_MI_DEVICE_NAME", raw.get("mi_device_name", "")
+        ),
         mi_device_dir=resolve_config_path(raw.get("mi_device_dir")),
-        mi_workload_model=raw.get("mi_workload_model", "llama3_8b"),
-        mi_dtype=raw.get("mi_dtype", "bf16"),
+        mi_dtype=os.environ.get(
+            "SGLANG_PDMUX_MI_DTYPE", raw.get("mi_dtype", "bf16")
+        ),
         mi_frequency_mhz=mi_frequency_mhz,
         mi_objective=mi_objective,
         mi_allow_modeled_throttling=raw.get("mi_allow_modeled_throttling", True),
-        bullet_srm_profile_path=resolve_config_path(raw.get("bullet_srm_profile_path")),
-        bullet_device_name=raw.get("bullet_device_name", "NVIDIA_A100-PCIE-40GB"),
+        mi_allow_extrapolation=raw.get("mi_allow_extrapolation", True),
+        bullet_srm_profile_path=resolve_config_path(
+            os.environ.get(
+                "SGLANG_PDMUX_BULLET_PROFILE_PATH",
+                raw.get("bullet_srm_profile_path"),
+            )
+        ),
+        bullet_device_name=os.environ.get(
+            "SGLANG_PDMUX_BULLET_DEVICE_NAME",
+            raw.get("bullet_device_name", ""),
+        ),
         bullet_device_dir=resolve_config_path(raw.get("bullet_device_dir")),
-        bullet_workload_model=raw.get("bullet_workload_model", "llama3_8b"),
-        bullet_dtype=raw.get("bullet_dtype", "bf16"),
+        bullet_dtype=os.environ.get(
+            "SGLANG_PDMUX_BULLET_DTYPE", raw.get("bullet_dtype", "bf16")
+        ),
         bullet_reference_frequency_mhz=bullet_reference_frequency_mhz,
         bullet_tpot_slo_ms=bullet_tpot_slo_ms,
         bullet_tpot_headroom=bullet_tpot_headroom,
         bullet_prefill_layers_per_step=bullet_prefill_layers_per_step,
         bullet_online_calibration=raw.get("bullet_online_calibration", True),
         bullet_online_calibration_weight=bullet_online_calibration_weight,
-        muxwise_profile_path=resolve_config_path(raw.get("muxwise_profile_path")),
+        muxwise_profile_path=resolve_config_path(
+            os.environ.get(
+                "SGLANG_PDMUX_MUXWISE_PROFILE_PATH",
+                raw.get("muxwise_profile_path"),
+            )
+        ),
         muxwise_tbt_slo_ms=muxwise_tbt_slo_ms,
         muxwise_tbt_headroom=muxwise_tbt_headroom,
         muxwise_online_guard_update=raw.get("muxwise_online_guard_update", True),
@@ -277,13 +278,4 @@ def load_adaptive_pdmux_config(config_path: str) -> AdaptivePDMuxConfig:
         profile_fixed_stream_idx=profile_fixed_stream_idx,
         profile_observation_path=profile_observation_path,
         profile_prefill_layers_per_step=profile_prefill_layers_per_step,
-        ours_policy_entrypoint=raw.get("ours_policy_entrypoint"),
-        ours_model_artifact_path=resolve_config_path(
-            raw.get("ours_model_artifact_path")
-        ),
-        ours_frequency_mhz=ours_frequency_mhz,
-        ours_allow_extrapolation=raw.get("ours_allow_extrapolation", True),
-        ours_hysteresis_fraction=ours_hysteresis_fraction,
-        ours_objective=ours_objective,
-        ours_tpot_slo_ms=ours_tpot_slo_ms,
     )

@@ -15,7 +15,7 @@ The artifact dispatcher only maps decode batch size through
 found no implementation or parameters for paper Equations 1/2, no contention
 grid, and no SLO-aware dispatcher. Consequently:
 
-- `pdmux_muxwise.yaml` / mode `muxwise_artifact` preserves the public static artifact
+- `configs/muxwise_artifact_a100.yaml` / mode `muxwise_artifact` preserves the public static artifact
   behavior, adapted from 132 H200 SMs to 108 A100 SMs.
 - `related_work/muxwise` / mode `muxwise_model` is our inspectable paper
   reproduction and requires a measured offline profile.

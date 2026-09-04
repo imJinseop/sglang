@@ -44,7 +44,7 @@ def _scheduler():
     scheduler.real_sm_group_num = len(scheduler.stream_groups)
     scheduler.pdmux_chunk_count = 0
     scheduler.pdmux_config = SimpleNamespace(
-        partition_policy="mi_cost_model",
+        partition_policy="mi",
         partition_transition="host_sync",
     )
     scheduler.model_config = SimpleNamespace(num_hidden_layers=32)

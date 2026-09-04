@@ -59,6 +59,8 @@ class BulletSRMTPOTPolicy:
         self,
         config: AdaptivePDMuxConfig,
         sm_counts: list[tuple[int, int]],
+        *,
+        model_config,
     ) -> None:
         if config.mi_path and config.mi_path not in sys.path:
             sys.path.insert(0, config.mi_path)
@@ -101,7 +103,7 @@ class BulletSRMTPOTPolicy:
         self._ExecutionState = ExecutionState
         self._build_llm_layer_work = build_llm_layer_work
         self._predictor = predictor
-        self._model = config.bullet_workload_model
+        self._model = model_config
         self._dtype = config.bullet_dtype
         self._frequency_mhz = config.bullet_reference_frequency_mhz
         self._tpot_slo_ms = config.bullet_tpot_slo_ms
