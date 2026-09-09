@@ -55,9 +55,7 @@ from sglang.srt.model_loader.weight_utils import (
 from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import add_prefix, is_cuda, is_npu, is_xpu, make_layers
-from sglang.srt.utils.layerwise_ground_truth import (
-    get_layerwise_ground_truth_recorder,
-)
+from sglang.srt.mi_ext.llama_recording import measured_llama_layers, record_llama_step
 from sglang.utils import get_exception_traceback
 
 _is_cuda = is_cuda()
@@ -441,39 +439,17 @@ class LlamaModel(nn.Module):
             deferred_norm = None
 
         aux_hidden_states = []
-        ground_truth = get_layerwise_ground_truth_recorder(
-            self.config.num_hidden_layers
-        )
-        ground_truth_forward_index = (
-            ground_truth.begin_forward() if ground_truth is not None else -1
-        )
+        layers = measured_llama_layers(self)
         for i in range(self.start_layer, self.end_layer):
             if i in self.layers_to_capture:
                 aux_hidden_states.append(hidden_states + residual)
-            layer = self.layers[i]
-            if ground_truth is None:
-                hidden_states, residual = layer(
-                    positions,
-                    hidden_states,
-                    forward_batch,
-                    residual,
-                )
-            else:
-                layer_hidden_states = hidden_states
-                layer_residual = residual
-                hidden_states, residual = ground_truth.measure_layer(
-                    layer_index=i,
-                    forward_index=ground_truth_forward_index,
-                    forward_batch=forward_batch,
-                    hidden_states=layer_hidden_states,
-                    residual=layer_residual,
-                    call=lambda measured_hidden, measured_residual: layer(
-                        positions,
-                        measured_hidden,
-                        forward_batch,
-                        measured_residual,
-                    ),
-                )
+            layer = layers[i]
+            hidden_states, residual = layer(
+                positions,
+                hidden_states,
+                forward_batch,
+                residual,
+            )
 
         if not self.pp_group.is_last_rank:
             return PPProxyTensors(
@@ -586,6 +562,7 @@ class LlamaForCausalLM(nn.Module):
         return LlamaModel(config, quant_config=quant_config, prefix=prefix)
 
     @torch.no_grad()
+    @record_llama_step
     def forward(
         self,
         input_ids: torch.Tensor,

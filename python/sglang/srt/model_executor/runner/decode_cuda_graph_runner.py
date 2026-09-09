@@ -98,12 +98,7 @@ from sglang.srt.model_executor.runner_utils.deepep_adapter import (
     DeepEPCudaGraphRunnerAdapter,
 )
 from sglang.srt.model_executor.runner_utils.shared_read_event import make_external_event
-from sglang.srt.multiplex.pdmux_context import (
-    get_current_stream_idx,
-    get_sm_counts,
-    get_stream_groups,
-    read_decode_graph_mode,
-)
+from sglang.srt.mi_ext import decode_graph as mi_decode_graph
 from sglang.srt.runtime_context import get_flags, get_parallel, get_spec
 from sglang.srt.speculative.ragged_verify import resolve_ragged_verify_layout
 from sglang.srt.utils import (
@@ -366,19 +361,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         # Attention backend
         self.max_bs = max(self.capture_bs)
         self.max_num_token = self.max_bs * self.captured_req_width
-
-        # PDMux normally needs the general attention backend plus graph state
-        # for every partition-specific decode backend. In full-sm-once mode,
-        # all decode capture/replay (including eager fallback) is routed to the
-        # one full-decode backend, so allocating graph state on the unused
-        # general backend would defeat part of the memory-saving ablation.
-        full_sm_once = (
-            self.enable_pdmux
-            and read_decode_graph_mode(self.model_runner.server_args.pdmux_config_path)
-            == "full_sm_once"
-        )
-        if not full_sm_once:
-            self.attn_backend.init_cuda_graph_state(self.max_bs, self.max_num_token)
+        mi_decode_graph.init_general_graph_state(self)
 
         # Init PDMux if needed
         self.maybe_init_pdmux()
@@ -481,29 +464,6 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                 f"Capture cuda graph failed: {e}\n" f"{CUDA_GRAPH_CAPTURE_FAILED_MSG}"
             )
 
-    def capture_statistics(self) -> dict[str, object]:
-        """Return the realized decode-graph capture cardinality.
-
-        ``capture_bs`` alone is insufficient for PDMux because the default
-        mode captures every batch bucket once per green-context stream.  The
-        backend dictionary is populated after capture and therefore reports
-        the actual number of replayable graph artifacts, including optional
-        LoRA/DSA variants.
-        """
-        captured_graphs = getattr(self.backend, "_graphs", {})
-        capture_stream_count = (
-            1
-            if self.enable_pdmux and self.pdmux_decode_graph_mode == "full_sm_once"
-            else len(self.stream_groups) if self.enable_pdmux else 1
-        )
-        return {
-            "mode": (self.pdmux_decode_graph_mode if self.enable_pdmux else "standard"),
-            "batch_sizes": list(self.capture_bs),
-            "batch_size_count": len(self.capture_bs),
-            "capture_stream_count": capture_stream_count,
-            "graph_artifact_count": len(captured_graphs),
-        }
-
     def _record_in_graph_metadata_prep_done(self):
         # Purely a marker at this point in the graph; where the shared reads
         # actually end is the attn backend's call.
@@ -524,9 +484,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
     def _replay_attn_backend(self) -> AttentionBackend:
         # Under pdmux each stream replays on its own group member.
         if self.enable_pdmux:
-            return self.model_runner.decode_attn_backend_group[
-                self._pdmux_graph_stream_idx()
-            ]
+            return self.model_runner.decode_attn_backend_group[mi_decode_graph.pdmux_graph_stream_idx(self)]
         return self.attn_backend
 
     def _resolve_shared_read_ends(self, attn_backend, forward_mode) -> SharedReadEnds:
@@ -570,31 +528,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         return self.buffers, self.max_bs
 
     def maybe_init_pdmux(self):
-        if self.enable_pdmux:
-            self.stream_groups = get_stream_groups()
-            self.pdmux_decode_graph_mode = read_decode_graph_mode(
-                self.model_runner.server_args.pdmux_config_path
-            )
-            sm_counts = get_sm_counts()
-            self.pdmux_decode_capture_stream_idx = max(
-                range(len(sm_counts)), key=lambda index: sm_counts[index][1]
-            )
-            graph_backends = (
-                (
-                    self.model_runner.decode_attn_backend_group[
-                        self.pdmux_decode_capture_stream_idx
-                    ],
-                )
-                if self.pdmux_decode_graph_mode == "full_sm_once"
-                else self.model_runner.decode_attn_backend_group
-            )
-            for attn_backend in graph_backends:
-                attn_backend.init_cuda_graph_state(self.max_bs, self.max_num_token)
-
-    def _pdmux_graph_stream_idx(self) -> int:
-        if getattr(self, "pdmux_decode_graph_mode", "per_partition") == "full_sm_once":
-            return self.pdmux_decode_capture_stream_idx
-        return get_current_stream_idx()
+        mi_decode_graph.maybe_init_pdmux(self)
 
     def _cache_loc_dtype(self):
         return torch.int64
@@ -741,7 +675,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
 
         graph_key = self._make_graph_key(
             cuda_graph_bs,
-            stream_idx=self._pdmux_graph_stream_idx() if self.enable_pdmux else None,
+            stream_idx=mi_decode_graph.pdmux_graph_stream_idx(self) if self.enable_pdmux else None,
             variant_label=self._resolve_lora_variant(forward_batch),
         )
 
@@ -1103,16 +1037,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                         self._capture_one_stream()
             else:
                 set_pdmux_status(False)
-                if self.pdmux_decode_graph_mode == "full_sm_once":
-                    capture_groups = (
-                        (
-                            self.pdmux_decode_capture_stream_idx,
-                            self.stream_groups[self.pdmux_decode_capture_stream_idx],
-                        ),
-                    )
-                else:
-                    capture_groups = tuple(enumerate(self.stream_groups))
-                for i, sg in capture_groups:
+                for i, sg in mi_decode_graph.capture_stream_groups(self):
                     with (
                         graph_capture(stream=sg[1]) as graph_capture_context,
                         profile_context as prof,
@@ -1352,7 +1277,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                 )
             variant_label = self._resolve_lora_variant(forward_batch)
             dsa_variant = self._resolve_dsa_variant(forward_batch)
-            stream_idx = self._pdmux_graph_stream_idx() if self.enable_pdmux else None
+            stream_idx = mi_decode_graph.pdmux_graph_stream_idx(self) if self.enable_pdmux else None
             self._replay_graph_key = self._make_graph_key(
                 graph_size_key, stream_idx, variant_label, dsa_variant
             )
@@ -1445,7 +1370,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
 
         variant_label = self._resolve_lora_variant(forward_batch)
         dsa_variant = self._resolve_dsa_variant(forward_batch)
-        stream_idx = self._pdmux_graph_stream_idx() if self.enable_pdmux else None
+        stream_idx = mi_decode_graph.pdmux_graph_stream_idx(self) if self.enable_pdmux else None
         self._replay_graph_key = self._make_graph_key(
             graph_size_key, stream_idx, variant_label, dsa_variant
         )

@@ -1,0 +1,16 @@
+{
+  "repository": "https://github.com/sgl-project/sglang.git",
+  "revision": "9d18277c2720f3a1d6e64f90259e1d1b9ba9a26a",
+  "extension_paths": [
+    "python/sglang/srt/mi_ext/",
+    "test/registered/unit/test_mi_",
+    "MI_EXTENSIONS.md"
+  ],
+  "upstream_hooks": {
+    "python/sglang/srt/managers/scheduler.py": "PDMux dispatcher and graph-capture telemetry",
+    "python/sglang/srt/model_executor/runner/decode_cuda_graph_runner.py": "Graph setup, capture and replay selection",
+    "python/sglang/srt/models/llama.py": "Optional layer and step measurement hooks",
+    "python/sglang/srt/multiplex/multiplexing_mixin.py": "Route native PDMux decode to its execution backend",
+    "python/sglang/srt/multiplex/pdmux_context.py": "Execution-mode configuration and stream setup"
+  }
+}

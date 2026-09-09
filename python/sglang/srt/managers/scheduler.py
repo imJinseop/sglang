@@ -276,7 +276,8 @@ from sglang.srt.mem_cache.common import (
 )
 from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
 from sglang.srt.model_loader.utils import get_resolved_model_impl
-from sglang.srt.multiplex.multiplexing_dispatch_mixin import (
+from sglang.srt.mi_ext import decode_graph as mi_decode_graph
+from sglang.srt.mi_ext.multiplex.multiplexing_dispatch_mixin import (
     SchedulerMultiplexDispatchMixin,
 )
 from sglang.srt.observability.metrics_collector import SchedulerMetricsCollector
@@ -4297,7 +4298,7 @@ class Scheduler(
             target_graph_memory_usage=self.tp_worker.graph_memory_usage,
             draft_graph_memory_usage=draft_graph_memory_usage,
         )
-        ret["graph_capture"] = self.tp_worker.graph_capture_statistics
+        ret["graph_capture"] = mi_decode_graph.graph_capture_statistics(self.tp_worker)
         ret["startup_time"] = self.startup_time
         ret["effective_max_running_requests_per_dp"] = self.max_running_requests
 

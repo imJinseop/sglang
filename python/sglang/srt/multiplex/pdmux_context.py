@@ -1,10 +1,11 @@
 from dataclasses import dataclass, field
-import json
-import os
 from typing import List
 
 import torch
 import yaml
+
+# MI extension hooks; implementation lives in mi_ext.
+from sglang.srt.mi_ext.multiplex import context as mi_context
 
 STREAM_GROUPS = []
 SM_COUNTS = []
@@ -21,64 +22,7 @@ class PDMuxConfig:
     )  # [prefill_sm, decode_sm, decode_bs_threshold]
     split_forward_token_budget: int = 65536
     decode_bs_divisor: int = 36
-    decode_graph_mode: str = "per_partition"
-
-
-PDMUX_CONCURRENCY_MODES = {
-    "per_partition",
-    "fixed_partition",
-    "single_decode_graph",
-}
-
-
-def apply_concurrency_mode(raw: dict) -> dict:
-    """Apply the benchmark's process-wide concurrency ablation override."""
-    result = dict(raw)
-    manual_override = os.environ.get("SGLANG_PDMUX_MANUAL_DIVISIONS")
-    if manual_override:
-        manual_divisions = json.loads(manual_override)
-        if not isinstance(manual_divisions, list) or not manual_divisions:
-            raise ValueError("SGLANG_PDMUX_MANUAL_DIVISIONS must be a non-empty JSON list")
-        result["manual_divisions"] = manual_divisions
-        result["sm_group_num"] = len(manual_divisions) + 2
-    mode = os.environ.get("SGLANG_PDMUX_CONCURRENCY_MODE", "per_partition")
-    if mode not in PDMUX_CONCURRENCY_MODES:
-        raise ValueError(
-            "SGLANG_PDMUX_CONCURRENCY_MODE must be one of: "
-            + ", ".join(sorted(PDMUX_CONCURRENCY_MODES))
-        )
-    if mode == "fixed_partition":
-        raw_division = os.environ.get("SGLANG_PDMUX_FIXED_DIVISION", "")
-        try:
-            prefill_sm, decode_sm = (
-                int(value.strip()) for value in raw_division.split(",", 1)
-            )
-        except (TypeError, ValueError) as exc:
-            raise ValueError(
-                "fixed_partition requires SGLANG_PDMUX_FIXED_DIVISION=PREFILL,DECODE"
-            ) from exc
-        if prefill_sm <= 0 or decode_sm <= 0:
-            raise ValueError("fixed partition SM counts must be positive")
-        result["sm_group_num"] = 3
-        result["manual_divisions"] = [[prefill_sm, decode_sm, 1]]
-        result["decode_graph_mode"] = "per_partition"
-        result["muxwise_allow_sm_interpolation"] = True
-    elif mode == "single_decode_graph":
-        result["decode_graph_mode"] = "full_sm_once"
-    return result
-
-
-def read_decode_graph_mode(config_path: str) -> str:
-    if not config_path:
-        return "per_partition"
-    with open(config_path, "r", encoding="utf-8") as file:
-        raw = apply_concurrency_mode(yaml.safe_load(file) or {})
-    mode = raw.get("decode_graph_mode", "per_partition")
-    if mode not in {"per_partition", "full_sm_once"}:
-        raise ValueError(
-            "decode_graph_mode must be one of: per_partition, full_sm_once"
-        )
-    return mode
+    decode_graph_mode: str = "per_partition"  # MI execution mode
 
 
 def load_pdmux_config(config_path: str) -> PDMuxConfig:
@@ -87,7 +31,7 @@ def load_pdmux_config(config_path: str) -> PDMuxConfig:
         return PDMuxConfig()
 
     with open(config_path, "r") as f:
-        raw = apply_concurrency_mode(yaml.safe_load(f) or {})
+        raw = mi_context.apply_concurrency_mode(yaml.safe_load(f) or {})
 
     if "sm_group_num" not in raw:
         raise ValueError("Missing required field: sm_group_num")
@@ -96,11 +40,6 @@ def load_pdmux_config(config_path: str) -> PDMuxConfig:
         raise ValueError("sm_group_num must be >= 3")
 
     manual_divisions = raw.get("manual_divisions", [])
-    decode_graph_mode = raw.get("decode_graph_mode", "per_partition")
-    if decode_graph_mode not in {"per_partition", "full_sm_once"}:
-        raise ValueError(
-            "decode_graph_mode must be one of: per_partition, full_sm_once"
-        )
 
     expected = raw["sm_group_num"] - 2
     if manual_divisions and len(manual_divisions) != expected:
@@ -114,7 +53,7 @@ def load_pdmux_config(config_path: str) -> PDMuxConfig:
         manual_divisions=manual_divisions,
         split_forward_token_budget=raw.get("split_forward_token_budget", 65536),
         decode_bs_divisor=raw.get("decode_bs_divisor", 36),
-        decode_graph_mode=decode_graph_mode,
+        decode_graph_mode=mi_context.decode_graph_mode(raw),
     )
 
 
@@ -202,20 +141,8 @@ def initialize_stream_groups(gpu_id: int, config: PDMuxConfig):
     STREAM_GROUPS.append(
         (torch.cuda.Stream(gpu_id), torch.cuda.Stream(gpu_id))
     )  # Normal stream for decode
-    if config.decode_graph_mode == "full_sm_once":
-        full_decode_stream = STREAM_GROUPS[-1][1]
-        STREAM_GROUPS = [
-            (
-                prefill_stream,
-                (
-                    full_decode_stream
-                    if 0 < index < len(STREAM_GROUPS) - 1
-                    else decode_stream
-                ),
-            )
-            for index, (prefill_stream, decode_stream) in enumerate(STREAM_GROUPS)
-        ]
 
+    STREAM_GROUPS = mi_context.configure_stream_groups(STREAM_GROUPS, config, gpu_id)
     CURRENT_STREAM_IDX = 0
     CURRENT_STREAM_GROUP = STREAM_GROUPS[CURRENT_STREAM_IDX]
 
@@ -241,22 +168,3 @@ def get_sm_counts() -> list[tuple[int, int]]:
 def get_current_stream_idx() -> int:
     """Get the current stream index."""
     return CURRENT_STREAM_IDX
-
-
-def decode_execution_stream_idx(
-    config: PDMuxConfig,
-    sm_counts: list[tuple[int, int]],
-    selected_stream_idx: int,
-) -> int:
-    """Map a policy partition to the backend that executes decode.
-
-    In ``full_sm_once`` mode decode is always planned and executed by the
-    maximum-SM backend, including eager fallback batches that cannot use a
-    captured graph. The selected index still chooses the eager prefill Green
-    Context.
-    """
-    # Older/native configs and lightweight test doubles predate this option.
-    # Their established behavior is one decode backend per selected partition.
-    if getattr(config, "decode_graph_mode", "per_partition") != "full_sm_once":
-        return selected_stream_idx
-    return max(range(len(sm_counts)), key=lambda index: sm_counts[index][1])

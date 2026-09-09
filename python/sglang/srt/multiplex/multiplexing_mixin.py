@@ -13,8 +13,8 @@ from torch.cuda.streams import ExternalStream
 
 from sglang.srt.distributed.parallel_state import set_pdmux_status
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.mi_ext.multiplex.context import decode_execution_stream_idx
 from sglang.srt.multiplex.pdmux_context import (
-    decode_execution_stream_idx,
     get_current_stream_idx,
     get_sm_counts,
     get_stream_groups,
@@ -77,10 +77,9 @@ class SchedulerMultiplexMixin:
 
         stream_idx = get_current_stream_idx()
 
-        decode_backend_idx = decode_execution_stream_idx(
-            self.pdmux_config, self.sm_counts, stream_idx
+        self.tp_worker.model_runner.update_decode_attn_backend(
+            decode_execution_stream_idx(self.pdmux_config, self.sm_counts, stream_idx)
         )
-        self.tp_worker.model_runner.update_decode_attn_backend(decode_backend_idx)
         return stream_idx, self.stream_groups[stream_idx]
 
     def update_split_prefill_batch(
