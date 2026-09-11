@@ -88,6 +88,57 @@ class TestPDMuxRuntimeDispatch(CustomTestCase):
             backend.init_cuda_graph_state.assert_not_called()
         backends[-1].init_cuda_graph_state.assert_called_once_with(32, 32)
 
+    def test_partitioned_capture_excludes_prefill_only_endpoint_and_keeps_replay_indices(self):
+        from sglang.srt.mi_ext.decode_graph import capture_statistics, capture_stream_groups
+
+        runner = object.__new__(DecodeCudaGraphRunner)
+        backends = [MagicMock() for _ in range(8)]
+        runner.enable_pdmux = True
+        runner.max_bs = runner.max_num_token = 128
+        runner.capture_bs = [1, 2, 4, 8, 16, 32, 64, 128]
+        runner.model_runner = SimpleNamespace(
+            server_args=SimpleNamespace(pdmux_config_path="pdmux.yaml"),
+            decode_attn_backend_group=backends,
+        )
+        groups = [(object(), object()) for _ in range(8)]
+        sm_counts = [(108, 0), (92, 16), (80, 28), (64, 44),
+                     (48, 60), (32, 76), (16, 92), (0, 108)]
+        with (
+            patch("sglang.srt.mi_ext.decode_graph.get_stream_groups", return_value=groups),
+            patch("sglang.srt.mi_ext.decode_graph.get_sm_counts", return_value=sm_counts),
+            patch("sglang.srt.mi_ext.decode_graph.read_decode_graph_mode", return_value="per_partition"),
+        ):
+            runner.maybe_init_pdmux()
+        backends[0].init_cuda_graph_state.assert_not_called()
+        for backend in backends[1:]:
+            backend.init_cuda_graph_state.assert_called_once_with(128, 128)
+        captures = capture_stream_groups(runner)
+        self.assertEqual([index for index, _ in captures], list(range(1, 8)))
+        self.assertTrue(all(group is groups[index] for index, group in captures))
+        runner.backend = SimpleNamespace(_graphs={
+            (index, bs): object() for index, _ in captures for bs in runner.capture_bs
+        })
+        stats = capture_statistics(runner)
+        self.assertEqual(stats['capture_stream_count'], 7)
+        self.assertEqual(stats['graph_artifact_count'], 56)
+        self.assertEqual(stats['batch_size_count'], 8)
+
+    def test_capture_skips_zero_decode_sm_without_renumbering_other_groups(self):
+        from sglang.srt.mi_ext.decode_graph import capture_stream_groups, maybe_init_pdmux
+
+        groups = [(object(), object()) for _ in range(4)]
+        runner = SimpleNamespace(enable_pdmux=True, max_bs=8, max_num_token=8,
+            model_runner=SimpleNamespace(server_args=SimpleNamespace(pdmux_config_path="test"),
+                                         decode_attn_backend_group=[MagicMock() for _ in groups]))
+        with (
+            patch("sglang.srt.mi_ext.decode_graph.get_stream_groups", return_value=groups),
+            patch("sglang.srt.mi_ext.decode_graph.get_sm_counts",
+                  return_value=[(80, 28), (108, 0), (64, 44), (0, 108)]),
+            patch("sglang.srt.mi_ext.decode_graph.read_decode_graph_mode", return_value="per_partition"),
+        ):
+            maybe_init_pdmux(runner)
+        self.assertEqual([index for index, _ in capture_stream_groups(runner)], [0, 2, 3])
+
     def test_fixed_partition_concurrency_override_replaces_candidate_menu(self):
         with patch.dict(
             "os.environ",

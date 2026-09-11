@@ -58,10 +58,98 @@ def _scheduler():
 
 
 class TestPDMuxConditionalSync(CustomTestCase):
-    def test_bullet_completed_chunks_reselect_even_with_interval_zero(self):
+    def test_decode_keeps_running_while_bullet_prefill_chunk_is_in_flight(self):
+        self._check_decode_progress_during_prefill_layer_chunk(bullet=True)
+
+    def test_decode_keeps_running_while_mi_prefill_layer_chunk_is_in_flight(self):
+        self._check_decode_progress_during_prefill_layer_chunk(bullet=False)
+
+    def _check_decode_progress_during_prefill_layer_chunk(self, *, bullet):
         module = "sglang.srt.mi_ext.multiplex.adaptive_multiplexing_mixin"
-        for bullet in (False, True):
-            with self.subTest(bullet=bullet):
+        scheduler = _scheduler()
+        order = []
+        progress = {"decode": 0}
+        prefill_stream, decode_stream = _FakeStream(), _FakeStream()
+
+        def record_chunk():
+            # One prefill chunk takes three decode steps on this fake GPU.
+            ready_after = progress["decode"] + 2
+            return SimpleNamespace(query=lambda: progress["decode"] >= ready_after)
+
+        prefill_stream.record_event = record_chunk
+        prefill_stream.synchronize = lambda: order.append("prefill_sync")
+        scheduler.stream_groups = [(prefill_stream, decode_stream)] * 4
+        scheduler.pdmux_config.partition_policy = "bullet_srm_tpot" if bullet else "mi"
+        scheduler.pdmux_config.reevaluate_every_prefill_layer_chunks = 0 if bullet else 1
+        scheduler.model_config.num_hidden_layers = 8
+        prefill = SimpleNamespace(
+            is_empty=lambda: False, batch_size=lambda: 1,
+            extend_num_tokens=8192, split_index=0, split_prefill_finished=False,
+        )
+        decode = SimpleNamespace(is_empty=lambda: False, batch_size=lambda: 2,
+                                 merge_batch=MagicMock())
+        scheduler.split_prefill_batch = prefill
+        scheduler.running_batch = decode
+        scheduler.bullet_pdmux_policy = object() if bullet else None
+        scheduler._pdmux_selected_prefill_layers = 4
+        scheduler._pdmux_active_bullet_decision = None
+        scheduler._pdmux_active_muxwise_decision = None
+        scheduler._pdmux_pending_bullet_prefill_observations = []
+        scheduler._pdmux_pending_profile_prefill_observations = []
+        scheduler.pdmux_profile_writer = None
+        scheduler.ps = SimpleNamespace(tp_size=1)
+        scheduler.tp_cpu_group = MagicMock()
+        scheduler.request_receiver = SimpleNamespace(
+            recv_requests=MagicMock(side_effect=[[]] * 6 + [StopIteration])
+        )
+        scheduler.process_input_requests = MagicMock()
+        scheduler.update_split_prefill_batch = MagicMock(
+            side_effect=[(True, decode)] + [(False, decode)] * 5
+        )
+        scheduler.update_running_batch = lambda batch: batch
+        scheduler._maybe_observe_pdmux_state = MagicMock()
+
+        def select(*, running_batch, trigger):
+            order.append(("select", prefill.split_index))
+            return 1, scheduler.stream_groups[1]
+
+        scheduler.adjust_stream_groups_adaptive = MagicMock(side_effect=select)
+
+        def run_batch(batch):
+            if batch is decode:
+                progress["decode"] += 1
+                order.append(("decode", progress["decode"]))
+            else:
+                order.append(("prefill", batch.split_index))
+            return object()
+
+        scheduler.run_batch = run_batch
+        scheduler.process_batch_result = lambda batch, _: order.append(
+            ("token", progress["decode"]) if batch is decode else "prefill_result"
+        )
+        with (
+            patch(f"{module}.get_current_stream_idx", return_value=1),
+            patch(f"{module}.set_pdmux_status"),
+            patch(f"{module}.torch.cuda.stream", side_effect=lambda _: nullcontext()),
+            patch(f"{module}.torch.cuda.empty_cache"),
+            self.assertRaises(StopIteration),
+        ):
+            scheduler.event_loop_pdmux_adaptive()
+        self.assertEqual(progress["decode"], 6)
+        self.assertEqual([x for x in order if isinstance(x, tuple) and x[0] == "prefill"],
+                         [("prefill", 0), ("prefill", 4)])
+        self.assertEqual([x for x in order if isinstance(x, tuple) and x[0] == "select"],
+                         [("select", 0), ("select", 4)])
+        self.assertLess(order.index(("token", 3)), order.index("prefill_sync"))
+        self.assertEqual(order.count("prefill_sync"), 2 if bullet else 1)
+        decode.merge_batch.assert_called_once_with(prefill)
+
+    def test_policy_refresh_cadence_and_optional_every_second_mi_layer_chunk(self):
+        module = "sglang.srt.mi_ext.multiplex.adaptive_multiplexing_mixin"
+        for policy, interval in (("decode_bs", 0), ("muxwise_slo", 0),
+                                 ("bullet_srm_tpot", 0), ("mi", 0), ("mi", 2)):
+            bullet = policy == "bullet_srm_tpot"
+            with self.subTest(policy=policy, interval=interval):
                 scheduler = _scheduler()
                 order = []
                 prefill_stream = _FakeStream()
@@ -69,10 +157,8 @@ class TestPDMuxConditionalSync(CustomTestCase):
                 prefill_stream.record_event = lambda: SimpleNamespace(query=lambda: True)
                 prefill_stream.synchronize = lambda: order.append("prefill_sync")
                 scheduler.stream_groups = [(prefill_stream, decode_stream)] * 4
-                scheduler.pdmux_config.partition_policy = (
-                    "bullet_srm_tpot" if bullet else "muxwise_slo"
-                )
-                scheduler.pdmux_config.repartition_interval_chunks = 0
+                scheduler.pdmux_config.partition_policy = policy
+                scheduler.pdmux_config.reevaluate_every_prefill_layer_chunks = interval
                 scheduler.model_config.num_hidden_layers = 10
                 prefill = SimpleNamespace(
                     is_empty=lambda: False, batch_size=lambda: 1,
@@ -129,7 +215,16 @@ class TestPDMuxConditionalSync(CustomTestCase):
                 launches = [item for item in order if isinstance(item, tuple) and item[0] == "launch"]
                 self.assertEqual(launches, [("launch", 4), ("launch", 4), ("launch", 2)])
                 selections = [item for item in order if isinstance(item, tuple) and item[0] == "select"]
-                self.assertEqual([s[1] for s in selections], [0, 4, 8] if bullet else [0])
+                self.assertEqual(
+                    [s[1] for s in selections],
+                    ([0, 8] if interval == 2 else [0]) if policy in {"decode_bs", "mi"} else [0, 4, 8],
+                )
+                if interval == 2:
+                    self.assertEqual(selections[-1][2], "layer_chunk_boundary")
+                    self.assertEqual(order.count("prefill_sync"), 1)
+                if policy == "muxwise_slo":
+                    self.assertEqual([s[2] for s in selections],
+                                     ["new_split_prefill", "decode_step", "decode_step"])
                 if bullet:
                     self.assertEqual(order, [
                         ("select", 0, "new_split_prefill"),
@@ -172,6 +267,32 @@ class TestPDMuxConditionalSync(CustomTestCase):
                     self.assertEqual(prefill.synchronize_calls, int(changed))
                     self.assertEqual(decode.synchronize_calls, int(changed))
                     self.assertFalse(prefill.recorded_events or decode.recorded_events)
+
+    def test_mi_default_boundary_syncs_both_lanes_only_on_change(self):
+        for selected in (1, 2):
+            scheduler = _scheduler()
+            scheduler.pdmux_config.partition_transition = 'host_sync_always'
+            prefill, decode = _FakeStream(), _FakeStream()
+            changed = scheduler._sync_streams_for_partition_change(
+                prefill, decode, current_stream_idx=1, selected_stream_idx=selected,
+                trigger='layer_chunk_boundary')
+            self.assertEqual(changed, selected != 1)
+            self.assertEqual(prefill.synchronize_calls, int(changed))
+            self.assertEqual(decode.synchronize_calls, int(changed))
+
+    def test_muxwise_decode_refresh_keeps_unchanged_prefill_running(self):
+        for selected in (1, 2):
+            scheduler = _scheduler()
+            scheduler.pdmux_config.partition_policy = "muxwise_slo"
+            scheduler.pdmux_config.partition_transition = "host_sync_always"
+            prefill, decode = _FakeStream(), _FakeStream()
+            changed = scheduler._sync_streams_for_partition_change(
+                prefill, decode, current_stream_idx=1,
+                selected_stream_idx=selected, trigger="decode_step",
+            )
+            self.assertEqual(changed, selected != 1)
+            self.assertEqual(prefill.synchronize_calls, int(changed))
+            self.assertEqual(decode.synchronize_calls, int(changed))
 
     def test_merge_handoff_follows_metadata_writes_even_without_partition_change(self):
         for has_decode in (True, False):

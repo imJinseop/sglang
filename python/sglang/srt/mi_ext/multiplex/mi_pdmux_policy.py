@@ -1,12 +1,13 @@
 # MI project extension; not part of upstream SGLang.
-"""MI cost-model policy for choosing among pre-created PDMux partitions."""
+"""Ours: minimum decode SM meeting TPOT at a predicted power-feasible clock."""
 
 from __future__ import annotations
 
 import sys
 import time
 import logging
-from dataclasses import dataclass
+import json
+from dataclasses import asdict, dataclass
 from typing import TYPE_CHECKING
 
 from sglang.srt.mi_ext.multiplex.policy_state import PDMuxPolicyInput
@@ -26,13 +27,19 @@ class MIPDMuxDecision:
     frequency_mhz: int
     decode_latency_ms: float
     prefill_latency_ms: float
-    blended_latency_ms: float
-    energy_j: float
     power_w: float
-    sustainable: bool
-    throttle_factor: float
-    effective_frequency_mhz: float
+    power_limit_w: float
+    power_limit_feasible: bool
+    effective_frequency_mhz: int
+    power_at_requested_frequency_w: float
+    frequency_evaluations: int
+    frequency_search: str
+    candidate_predictions: tuple[dict, ...]
     candidates_evaluated: int
+    feasible_candidates: int
+    tpot_limit_ms: float
+    tpot_satisfied: bool
+    reason: str
     decision_time_ms: float
     prefill_tokens: int
     decode_batch: int
@@ -46,8 +53,9 @@ class MIPDMuxPolicy:
     """Run MI online, but return only an already-created PDMux stream group.
 
     PDMux cannot resize a Green Context in place.  The policy therefore gives
-    MI exactly the finite set of internal ``(prefill_sm, decode_sm)`` groups
-    whose decode CUDA graphs were captured during engine initialization.
+    MI exactly the finite set of internal ``(prefill_sm, decode_sm)`` groups.
+    Partitioned execution captures a decode graph set per group; SM oversubscription
+    shares its full-SM decode graph set across these prefill choices.
     """
 
     def __init__(
@@ -63,13 +71,9 @@ class MIPDMuxPolicy:
 
         try:
             from bullet_green import (
-                BulletGreenPlanner,
                 ExecutionPlan,
                 ExecutionState,
                 MISGLangRuntimePredictor,
-                Objective,
-                ScheduleConstraints,
-                build_llm_layer_work,
             )
             from modeling.cost_model.workload import get_model_spec
         except ImportError as exc:
@@ -87,42 +91,35 @@ class MIPDMuxPolicy:
             dtype=config.mi_dtype,
             allow_extrapolation=config.mi_allow_extrapolation,
             calibration_path=config.mi_calibration_path,
+            power_limit_w=config.mi_power_limit_w,
         )
-        logger.info("MI is using the shared SGLang unit-coefficient model")
+        logger.info(
+            "Ours selects minimum decode SM satisfying TPOT at a shared power-feasible clock"
+        )
         if predictor.total_sm != sum(sm_counts[1]):
             raise ValueError(
                 "MI device profile and PDMux GPU disagree on total SM count: "
                 f"MI={predictor.total_sm}, PDMux={sum(sm_counts[1])}"
             )
 
-        frequency_mhz = config.mi_frequency_mhz or max(
-            predictor.frequencies_mhz
-        )
+        frequency_mhz = config.mi_frequency_mhz or max(predictor.frequencies_mhz)
         if frequency_mhz not in predictor.frequencies_mhz:
             raise ValueError(
-                f"mi_frequency_mhz={frequency_mhz} is not calibrated; "
+                f"mi_frequency_mhz={frequency_mhz} is not a supported GPU clock; "
                 f"available frequencies are {predictor.frequencies_mhz}"
             )
 
         self._ExecutionState = ExecutionState
-        self._build_llm_layer_work = build_llm_layer_work
+        # The predictor expands model invocations itself. No legacy roofline
+        # workload construction or Bullet SRM is involved in this policy.
         # Model dimensions come from the exact Hugging Face config SGLang has
         # already loaded for ``model_path``. Device terms remain exclusively in
-        # device/<device>/{calibration,runtime_coefficients}.json.
+        # device/<device>/calibration.json and the device's dispatch tables.
         self._model = get_model_spec(model_config)
-        self._dtype = config.mi_dtype
         self._frequency_mhz = frequency_mhz
         self._split_forward_token_budget = config.split_forward_token_budget
-        self._constraints = ScheduleConstraints(
-            allow_modeled_throttling=config.mi_allow_modeled_throttling
-        )
-        self._planner = BulletGreenPlanner(
-            predictor,
-            total_sm=predictor.total_sm,
-            frequencies_mhz=(frequency_mhz,),
-            sm_granularity=2,
-            objective=Objective(config.mi_objective),
-        )
+        self._tpot_slo_ms = config.mi_tpot_slo_ms
+        self._predictor = predictor
 
         self._plans = tuple(
             ExecutionPlan(
@@ -130,11 +127,10 @@ class MIPDMuxPolicy:
                 prefill_sm=prefill_sm,
                 frequency_mhz=frequency_mhz,
             )
-            for prefill_sm, decode_sm in sm_counts[1:-1]
+            for prefill_sm, decode_sm in sorted(sm_counts[1:-1], key=lambda pair: pair[1])
         )
         self._stream_idx = {
-            (plan.decode_sm, plan.prefill_sm): stream_idx
-            for stream_idx, plan in enumerate(self._plans, start=1)
+            (d, p): i for i, (p, d) in enumerate(sm_counts[1:-1], start=1)
         }
         if not self._plans:
             raise ValueError("MI PDMux policy requires at least one paired partition")
@@ -152,13 +148,19 @@ class MIPDMuxPolicy:
         prefill = policy_input.prefill
         decode = policy_input.decode
         total_layers = prefill.total_layers
+        if total_layers != self._model.num_layers:
+            raise ValueError("scheduler layer count differs from the MI model config")
+        if prefill.reused_tokens:
+            raise NotImplementedError(
+                "Ours step predictor currently supports fresh-prompt prefill; "
+                "prefix-cache attention is not modeled"
+            )
         remaining_layers = prefill.remaining_layers
         prefill_layers = min(
             remaining_layers,
             max(
                 1,
-                self._split_forward_token_budget
-                // max(1, prefill.new_tokens),
+                self._split_forward_token_budget // max(1, prefill.new_tokens),
             ),
         )
         state = self._ExecutionState(
@@ -170,44 +172,62 @@ class MIPDMuxPolicy:
             prefill_layers_in_quantum=prefill_layers,
             decode_layers_in_quantum=total_layers,
         )
-        layer_work = self._build_llm_layer_work(
-            state,
-            model=self._model,
-            dtype=self._dtype,
-        )
-        decode_work = layer_work.decode.scaled(total_layers)
-        prefill_work = (
-            layer_work.prefill
-            if prefill_layers == 1
-            else layer_work.prefill.scaled(prefill_layers)
-        )
-        decision = self._planner.select(
-            state,
-            decode_work,
-            prefill_work,
-            constraints=self._constraints,
-            plans=self._plans,
-        )
-        estimate = decision.estimate
+        estimates = []
+        for plan in self._plans:
+            try:
+                current = self._predictor.predict_execution(state, plan)
+                estimates.append(current)
+                if current.power_limit_feasible and current.decode_latency_s*1e3 <= self._tpot_slo_ms:
+                    break  # Sorted SM menu: larger decode allocations cannot win.
+            except NotImplementedError as exc:
+                # Preserve the actual ragged state as well as the projected
+                # predictor dimensions. This candidate has not been selected
+                # or submitted to the GPU; do not report a kernel launch here.
+                context = {
+                    "policy_input": asdict(policy_input),
+                    "execution_state": asdict(state),
+                    "candidate_plan": asdict(plan),
+                    "candidate_submitted": False,
+                }
+                raise NotImplementedError(
+                    f"{exc}\nMI_POLICY_INPUT_JSON="
+                    + json.dumps(context, separators=(",", ":"))
+                ) from exc
+        power_feasible = [x for x in estimates if x.power_limit_feasible]
+        feasible = [x for x in power_feasible if x.decode_latency_s*1e3 <= self._tpot_slo_ms]
+        if feasible:
+            estimate = min(feasible, key=lambda x: x.plan.decode_sm)
+            reason = "minimum_decode_sm_within_tpot_slo"
+        else:
+            estimate = min(power_feasible or estimates,
+                           key=lambda x: (x.decode_latency_s, x.plan.decode_sm))
+            reason = ("no_feasible_candidate_minimum_decode_latency" if power_feasible
+                      else "no_power_feasible_candidate")
         stream_idx = self._stream_idx[
-            (decision.plan.decode_sm, decision.plan.prefill_sm)
+            (estimate.plan.decode_sm, estimate.plan.prefill_sm)
         ]
         return MIPDMuxDecision(
             stream_idx=stream_idx,
-            prefill_sm=decision.plan.prefill_sm,
-            decode_sm=decision.plan.decode_sm,
-            frequency_mhz=decision.plan.frequency_mhz,
+            prefill_sm=estimate.plan.prefill_sm,
+            decode_sm=estimate.plan.decode_sm,
+            frequency_mhz=estimate.plan.frequency_mhz,
             decode_latency_ms=estimate.decode_latency_s * 1e3,
             prefill_latency_ms=estimate.prefill_latency_s * 1e3,
-            blended_latency_ms=estimate.blended_latency_s * 1e3,
-            energy_j=estimate.total_energy_j,
-            power_w=estimate.power_demand_w,
-            sustainable=estimate.sustainable,
-            throttle_factor=estimate.throttle_factor,
-            effective_frequency_mhz=(
-                decision.plan.frequency_mhz / estimate.throttle_factor
+            power_w=estimate.power_w,
+            power_limit_w=estimate.power_limit_w,
+            power_limit_feasible=estimate.power_limit_feasible,
+            effective_frequency_mhz=estimate.effective_frequency_mhz,
+            power_at_requested_frequency_w=estimate.power_at_requested_frequency_w,
+            frequency_evaluations=sum(x.frequency_evaluations for x in estimates),
+            frequency_search=estimate.frequency_search,
+            candidate_predictions=tuple(asdict(x) for x in estimates),
+            candidates_evaluated=len(estimates),
+            feasible_candidates=len(feasible),
+            tpot_limit_ms=self._tpot_slo_ms,
+            tpot_satisfied=(
+                estimate.power_limit_feasible and estimate.decode_latency_s * 1e3 <= self._tpot_slo_ms
             ),
-            candidates_evaluated=decision.candidates_evaluated,
+            reason=reason,
             decision_time_ms=(time.perf_counter() - start) * 1e3,
             prefill_tokens=state.prefill_tokens,
             decode_batch=state.decode_batch,

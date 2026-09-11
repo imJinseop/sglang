@@ -1,5 +1,5 @@
 # MI project extension; not part of upstream SGLang.
-"""Decode graph selection and experiment telemetry for PDMux/OmniDecode."""
+"""Decode graph selection and experiment telemetry for PDMux/SM oversubscription."""
 
 from sglang.srt.multiplex.pdmux_context import (
     get_current_stream_idx,
@@ -32,7 +32,7 @@ def capture_statistics(self) -> dict[str, object]:
     capture_stream_count = (
         1
         if self.enable_pdmux and self.pdmux_decode_graph_mode == "full_sm_once"
-        else len(self.stream_groups) if self.enable_pdmux else 1
+        else len(capture_stream_groups(self)) if self.enable_pdmux else 1
     )
     return {
         "mode": (self.pdmux_decode_graph_mode if self.enable_pdmux else "standard"),
@@ -50,19 +50,14 @@ def maybe_init_pdmux(self):
             self.model_runner.server_args.pdmux_config_path
         )
         sm_counts = get_sm_counts()
+        self.pdmux_decode_stream_indices = tuple(
+            index for index, (_, decode_sm) in enumerate(sm_counts) if decode_sm > 0
+        )
         self.pdmux_decode_capture_stream_idx = max(
             range(len(sm_counts)), key=lambda index: sm_counts[index][1]
         )
-        graph_backends = (
-            (
-                self.model_runner.decode_attn_backend_group[
-                    self.pdmux_decode_capture_stream_idx
-                ],
-            )
-            if self.pdmux_decode_graph_mode == "full_sm_once"
-            else self.model_runner.decode_attn_backend_group
-        )
-        for attn_backend in graph_backends:
+        for index, _ in capture_stream_groups(self):
+            attn_backend = self.model_runner.decode_attn_backend_group[index]
             attn_backend.init_cuda_graph_state(self.max_bs, self.max_num_token)
 
 
@@ -99,4 +94,6 @@ def capture_stream_groups(self):
     if self.pdmux_decode_graph_mode == "full_sm_once":
         index = self.pdmux_decode_capture_stream_idx
         return ((index, self.stream_groups[index]),)
-    return tuple(enumerate(self.stream_groups))
+    # The prefill-only endpoint still has a dummy normal decode stream, but no
+    # decode work is scheduled there. Keep original indices for replay keys.
+    return tuple((index, self.stream_groups[index]) for index in self.pdmux_decode_stream_indices)

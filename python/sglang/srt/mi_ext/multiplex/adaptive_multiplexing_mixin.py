@@ -35,6 +35,11 @@ class SchedulerAdaptiveMultiplexMixin:
         self._pdmux_trace_file = None
         self._pdmux_trace_seq = 0
         self._pdmux_trace_start_s = time.perf_counter()
+        self._pdmux_mi_prediction_file = None
+        prediction_path = os.environ.get("SGLANG_PDMUX_MI_PREDICTION_PATH")
+        if prediction_path and self.pdmux_config.partition_policy == "mi":
+            os.makedirs(os.path.dirname(prediction_path) or ".", exist_ok=True)
+            self._pdmux_mi_prediction_file = open(prediction_path, "w", encoding="utf-8", buffering=1)
         trace_path = os.environ.get("SGLANG_PDMUX_TRACE_PATH")
         if not trace_path:
             return
@@ -42,6 +47,9 @@ class SchedulerAdaptiveMultiplexMixin:
         self._pdmux_trace_file = open(trace_path, "w", encoding="utf-8", buffering=1)
 
     def _trace_pdmux_event(self: Scheduler, event: str, **fields) -> None:
+        prediction_file = getattr(self, "_pdmux_mi_prediction_file", None)
+        if event == "mi_prediction_active" and prediction_file is not None:
+            prediction_file.write(json.dumps(dict(monotonic_s=time.perf_counter(), **fields)) + "\n")
         file = getattr(self, "_pdmux_trace_file", None)
         if file is None:
             return
@@ -145,7 +153,7 @@ class SchedulerAdaptiveMultiplexMixin:
             "last_selected_stream_idx": decision.get("selected_stream_idx"),
             "last_predicted_decode_ms": decision.get("decode_latency_ms"),
             "last_predicted_prefill_ms": decision.get("prefill_latency_ms"),
-            "last_predicted_blended_ms": decision.get("blended_latency_ms"),
+            "last_predicted_frequency_mhz": decision.get("effective_frequency_mhz"),
             "last_predicted_tpot_ms": decision.get("predicted_tpot_ms"),
             "last_bottleneck_lane": decision.get("bottleneck_lane"),
         }
@@ -161,6 +169,13 @@ class SchedulerAdaptiveMultiplexMixin:
         hook is called after those upstream steps and must never recreate a
         stream group or mutate the fixed candidate menu.
         """
+        if any(getattr(self.pdmux_config, key, False) for key in (
+            "bullet_online_calibration", "muxwise_online_guard_update"
+        )):
+            raise ValueError(
+                "online calibration is unavailable: launch-state and overlap "
+                "attribution are not validated; use offline profiles"
+            )
         self.pdmux_chunk_count = 0
         self._init_pdmux_trace()
         self._init_pdmux_observer()
@@ -247,7 +262,7 @@ class SchedulerAdaptiveMultiplexMixin:
             "pdmux_initialized",
             policy=self.pdmux_config.partition_policy,
             decode_graph_mode=self.pdmux_config.decode_graph_mode,
-            repartition_interval_chunks=(self.pdmux_config.repartition_interval_chunks),
+            reevaluate_every_prefill_layer_chunks=(self.pdmux_config.reevaluate_every_prefill_layer_chunks),
             split_forward_token_budget=(self.pdmux_config.split_forward_token_budget),
             partition_transition=self.pdmux_config.partition_transition,
             sm_counts=self.sm_counts,
@@ -423,13 +438,26 @@ class SchedulerAdaptiveMultiplexMixin:
                 decision_fields = {
                     "decode_latency_ms": decision.decode_latency_ms,
                     "prefill_latency_ms": decision.prefill_latency_ms,
-                    "blended_latency_ms": decision.blended_latency_ms,
-                    "predicted_energy_j": decision.energy_j,
                     "predicted_power_w": decision.power_w,
-                    "sustainable": decision.sustainable,
-                    "throttle_factor": decision.throttle_factor,
+                    "power_limit_w": decision.power_limit_w,
+                    "power_limit_feasible": decision.power_limit_feasible,
                     "effective_frequency_mhz": decision.effective_frequency_mhz,
-                    "selection_objective": self.pdmux_config.mi_objective,
+                    "power_at_requested_frequency_w": decision.power_at_requested_frequency_w,
+                    "frequency_evaluations": decision.frequency_evaluations,
+                    "frequency_search": decision.frequency_search,
+                    "candidate_predictions": decision.candidate_predictions,
+                    "selection_objective": "minimum_decode_sm_within_tpot_slo",
+                    "prediction_scope": "continuously_busy_prefill_and_decode_lanes",
+                    "batch_projection": "ceil_mean_sequence_length",
+                    "prefill_batch": policy_input.prefill.batch_size,
+                    "prefill_sequence_lengths": policy_input.prefill.new_tokens_by_request,
+                    "decode_context_lengths": policy_input.decode.context_tokens_by_request,
+                    "prediction_frequency_mhz": decision.frequency_mhz,
+                    "host_overhead_included": False,
+                    "tpot_limit_ms": decision.tpot_limit_ms,
+                    "tpot_satisfied": decision.tpot_satisfied,
+                    "feasible_candidates": decision.feasible_candidates,
+                    "reason": decision.reason,
                     "bottleneck_lane": (
                         "prefill"
                         if decision.prefill_latency_ms >= decision.decode_latency_ms
@@ -448,36 +476,12 @@ class SchedulerAdaptiveMultiplexMixin:
                     "decode_layers": decision.decode_layers,
                 }
                 logger.info(
-                    "MI PDMux decision: chunk=%d layer=%d remaining=%d "
-                    "quantum=(P_layers=%d,D_layers=%d) "
-                    "state=(prefill_tokens=%d, decode_bs=%d, "
-                    "decode_context_tokens=%d) stream=%d sm=(P%d,D%d) "
-                    "f=%dMHz predicted=(D=%.3fms,P=%.3fms,blend=%.3fms,"
-                    "energy=%.3fJ,power=%.1fW,sustainable=%s,"
-                    "throttle=%.3fx,effective_f=%.1fMHz) "
-                    "candidates=%d decision=%.3fms",
-                    self.pdmux_chunk_count,
-                    self.split_prefill_batch.split_index,
-                    decision.remaining_layers,
-                    decision.prefill_layers,
-                    decision.decode_layers,
-                    decision.prefill_tokens,
-                    decision.decode_batch,
-                    decision.decode_context_tokens,
-                    decision.stream_idx,
-                    decision.prefill_sm,
-                    decision.decode_sm,
-                    decision.frequency_mhz,
-                    decision.decode_latency_ms,
-                    decision.prefill_latency_ms,
-                    decision.blended_latency_ms,
-                    decision.energy_j,
-                    decision.power_w,
-                    decision.sustainable,
-                    decision.throttle_factor,
-                    decision.effective_frequency_mhz,
-                    decision.candidates_evaluated,
-                    decision.decision_time_ms,
+                    "MI decision: P%d/D%d f=%d->%dMHz TPOT=%.3fms cap=%.1fW "
+                    "power=%.1fW candidates=%d frequency_evaluations=%d CPU=%.3fms",
+                    decision.prefill_sm, decision.decode_sm, decision.frequency_mhz,
+                    decision.effective_frequency_mhz, decision.decode_latency_ms,
+                    decision.power_limit_w, decision.power_w, decision.candidates_evaluated,
+                    decision.frequency_evaluations, decision.decision_time_ms,
                 )
             else:
                 decode_bs = running_batch.batch_size()
@@ -572,10 +576,15 @@ class SchedulerAdaptiveMultiplexMixin:
         if (
             self.pdmux_config.partition_policy == "bullet_srm_tpot"
             and trigger == "layer_chunk_boundary"
+        ) or (
+            self.pdmux_config.partition_policy == "mi"
+            and trigger == "layer_chunk_boundary" and transition == "host_sync_always"
+        ) or (
+            self.pdmux_config.partition_policy == "muxwise_slo"
+            and trigger == "decode_step"
         ):
-            # Bullet already completed its prefill quantum before selecting.
-            # Keep the current pair without another barrier; a different pair
-            # must drain both old lanes before changing Green Contexts.
+            # Policy-specific refreshes retain an unchanged pair. A different
+            # pair must drain both old lanes before changing Green Contexts.
             transition = "host_sync"
         partition_changed = selected_stream_idx != current_stream_idx
         if not partition_changed and transition != "host_sync_always":
@@ -698,6 +707,29 @@ class SchedulerAdaptiveMultiplexMixin:
             return True, running_batch
         return False, running_batch
 
+    def _complete_prefill_layer_chunk(self) -> bool:
+        """Complete a requested prefill layer chunk boundary while decode runs.
+
+        Bullet requests every chunk; MI can request every N chunks or none.
+        Event completion is checked before recalculating or queuing more prefill.
+        Output-token/metadata handoff remains a separate completion path.
+        """
+        pending = self._pdmux_prefill_layer_chunk_pending
+        if pending is None or not pending[0].query():
+            return False
+        event, stream, chunk, layer_end, layer_count, stream_idx = pending
+        start = time.perf_counter()
+        stream.synchronize()  # The chunk has completed; no long host wait.
+        self._pdmux_prefill_layer_chunk_pending = None
+        self._trace_pdmux_event(
+            "bullet_prefill_chunk_completed" if self.bullet_pdmux_policy is not None
+            else "prefill_layer_chunk_completed",
+            chunk=chunk, completed_through_layer=layer_end,
+            layer_count=layer_count, stream_idx=stream_idx,
+            sync_ms=(time.perf_counter() - start) * 1e3,
+        )
+        return layer_end < self.model_config.num_hidden_layers
+
     @torch.inference_mode()
     def event_loop_pdmux_adaptive(self: Scheduler):
         """Adaptive PDMux loop used only by ``runtime_mode=improved``."""
@@ -712,11 +744,15 @@ class SchedulerAdaptiveMultiplexMixin:
         decode_stream = stream_group[1]
         self._pdmux_prefill_chunk_event = None
         self._pdmux_prefill_chunk_event_stream_idx = None
+        self._pdmux_prefill_layer_chunk_pending = None
         torch.cuda.empty_cache()
 
         logger.debug("Starting event loop for pd multiplexing...")
 
         while True:
+            if self._complete_prefill_layer_chunk():
+                adjust_stream_group = True
+                adjust_stream_group_reason = "layer_chunk_boundary"
             with torch.cuda.stream(decode_stream):
                 set_pdmux_status(False)
                 recv_reqs = self.request_receiver.recv_requests()
@@ -786,6 +822,13 @@ class SchedulerAdaptiveMultiplexMixin:
                         self.sm_counts[stream_idx][0],
                         self.sm_counts[stream_idx][1],
                     )
+                if self.pdmux_config.partition_policy == "mi":
+                    last = getattr(self, "_pdmux_last_decision", {})
+                    self._trace_pdmux_event("mi_prediction_active",
+                        active=bool(self.split_prefill_batch is not None and not running_batch.is_empty()
+                                    and "effective_frequency_mhz" in last),
+                        prefill_sm=self.sm_counts[stream_idx][0],
+                        decode_sm=self.sm_counts[stream_idx][1], **last)
                 adjust_stream_group = False
                 adjust_stream_group_reason = None
 
@@ -802,7 +845,7 @@ class SchedulerAdaptiveMultiplexMixin:
                     timed_decision = (
                         self._pdmux_active_muxwise_decision
                         or self._pdmux_active_bullet_decision
-                    )
+                    ) if getattr(self, "_pdmux_trace_file", None) is not None else None
                     profile_decode_snapshot = None
                     if self.pdmux_profile_writer is not None:
                         profile_decode_snapshot = self.pdmux_profile_writer.snapshot(
@@ -844,6 +887,7 @@ class SchedulerAdaptiveMultiplexMixin:
                     self.split_prefill_batch
                     and not self.split_prefill_batch.is_empty()
                     and not wait_prefill_kernel_done
+                    and self._pdmux_prefill_layer_chunk_pending is None
                 ):
                     prefill_done = True
                     policy_layers = self._pdmux_selected_prefill_layers
@@ -881,7 +925,10 @@ class SchedulerAdaptiveMultiplexMixin:
                         prefill_sm=self.sm_counts[stream_idx][0],
                         decode_sm=self.sm_counts[stream_idx][1],
                     )
-                    bullet_prefill_decision = self._pdmux_active_bullet_decision
+                    bullet_prefill_decision = (
+                        self._pdmux_active_bullet_decision
+                        if getattr(self, "_pdmux_trace_file", None) is not None else None
+                    )
                     profile_prefill_snapshot = None
                     if self.pdmux_profile_writer is not None:
                         profile_prefill_snapshot = self.pdmux_profile_writer.snapshot(
@@ -923,10 +970,11 @@ class SchedulerAdaptiveMultiplexMixin:
                                     profile_prefill_snapshot,
                                 )
                             )
-                    interval = self.pdmux_config.repartition_interval_chunks
+                    interval = self.pdmux_config.reevaluate_every_prefill_layer_chunks
                     chunk_event = None
                     if (
                         interval > 0
+                        or self.bullet_pdmux_policy is not None
                         or next_split_index == self.model_config.num_hidden_layers
                     ):
                         chunk_event = prefill_stream.record_event()
@@ -955,47 +1003,15 @@ class SchedulerAdaptiveMultiplexMixin:
                         completed_through_layer=next_split_index,
                         stream_idx=stream_idx,
                     )
-                    bullet_chunk_completed = False
-                    if self.bullet_pdmux_policy is not None:
-                        # Bullet SS3.3.1: finish each fixed-layer prefill step
-                        # before the CPU makes its next scheduling decision.
-                        # This is intrinsic to Bullet, independent of the
-                        # optional periodic reevaluation for other policies.
-                        prefill_sync_start = time.perf_counter()
-                        prefill_stream.synchronize()
-                        bullet_chunk_completed = True
-                        self._trace_pdmux_event(
-                            "bullet_prefill_chunk_completed",
-                            chunk=self.pdmux_chunk_count,
-                            completed_through_layer=next_split_index,
-                            layer_count=forward_count,
-                            stream_idx=stream_idx,
-                            sync_ms=(time.perf_counter() - prefill_sync_start) * 1e3,
-                        )
-                    if (
-                        next_split_index < self.model_config.num_hidden_layers
-                        and (
-                            bullet_chunk_completed
-                            or (
-                                interval > 0
-                                and self.pdmux_chunk_count % interval == 0
-                            )
-                        )
+                    if self.bullet_pdmux_policy is not None or (
+                        interval > 0 and self.pdmux_chunk_count % interval == 0
+                        and next_split_index < self.model_config.num_hidden_layers
                     ):
-                        adjust_stream_group = True
-                        adjust_stream_group_reason = "layer_chunk_boundary"
-                        self._trace_pdmux_event(
-                            "partition_reevaluation_requested",
-                            trigger=adjust_stream_group_reason,
-                            chunk=self.pdmux_chunk_count,
-                            next_layer=next_split_index,
-                            current_stream_idx=stream_idx,
-                        )
-                        logger.info(
-                            "PDMux layer-chunk boundary: completed chunk=%d, "
-                            "next layer=%d; scheduling partition reevaluation",
-                            self.pdmux_chunk_count,
-                            next_split_index,
+                        # Wait for actual GPU completion before reevaluation;
+                        # decode can keep making progress while this is pending.
+                        self._pdmux_prefill_layer_chunk_pending = (
+                            chunk_event, prefill_stream, self.pdmux_chunk_count,
+                            next_split_index, forward_count, stream_idx,
                         )
 
                 elif wait_prefill_kernel_done:
@@ -1057,6 +1073,23 @@ class SchedulerAdaptiveMultiplexMixin:
                         )
                 if decode_done:
                     self.process_batch_result(running_batch, decode_result)
+
+            if self._complete_prefill_layer_chunk():
+                adjust_stream_group = True
+                adjust_stream_group_reason = "layer_chunk_boundary"
+
+            if (
+                self.pdmux_config.partition_policy == "muxwise_slo"
+                and decode_done
+                and self.split_prefill_batch is not None
+                and not self.split_prefill_batch.split_prefill_finished
+                and not adjust_stream_group
+            ):
+                # MuxWise paper §3.4.2 refreshes allocation after each decode
+                # iteration, using the current batch and growing contexts.
+                # Do not price an already submitted final prefill chunk again.
+                adjust_stream_group = True
+                adjust_stream_group_reason = "decode_step"
 
             pending_prefill = []
             for (
@@ -1122,6 +1155,8 @@ class SchedulerAdaptiveMultiplexMixin:
                         )
                         self.running_batch = running_batch
 
+                        if self.pdmux_config.partition_policy == "mi":
+                            self._trace_pdmux_event("mi_prediction_active", active=False)
                         self.split_prefill_batch = None
                         self.pdmux_chunk_count = 0
                         self._pdmux_prefill_chunk_event = None

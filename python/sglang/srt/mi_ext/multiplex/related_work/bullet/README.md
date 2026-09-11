@@ -21,7 +21,7 @@ performance model used here is therefore an independent paper reproduction:
   the decode TPOT limit.
 - `../../adaptive_multiplexing_mixin.py`: executes the selected fixed number of prefill
   layers, synchronizes the prefill stream, and requests a new policy decision
-  before the next chunk. This happens even with `repartition_interval_chunks=0`.
+  before the next chunk. This happens even with `reevaluate_every_prefill_layer_chunks=0`.
   Completed CUDA-event measurements are offered to the SRM; online updates
   remain controlled separately by `bullet_online_calibration`.
 

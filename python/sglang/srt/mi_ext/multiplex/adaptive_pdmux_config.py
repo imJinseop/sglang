@@ -23,7 +23,7 @@ from sglang.srt.multiplex.pdmux_context import (PDMuxConfig)
 class AdaptivePDMuxConfig(PDMuxConfig):
     runtime_mode: str = "native"
     partition_policy: str = "decode_bs"
-    repartition_interval_chunks: int = 0
+    reevaluate_every_prefill_layer_chunks: int = 0
     partition_transition: str = "host_sync_always"
     mi_path: Optional[str] = None
     mi_device_name: str = ""
@@ -31,8 +31,8 @@ class AdaptivePDMuxConfig(PDMuxConfig):
     mi_calibration_path: Optional[str] = None
     mi_dtype: str = "bf16"
     mi_frequency_mhz: Optional[int] = None
-    mi_objective: str = "latency"
-    mi_allow_modeled_throttling: bool = True
+    mi_tpot_slo_ms: float = 10.0
+    mi_power_limit_w: Optional[float] = None
     mi_allow_extrapolation: bool = True
     bullet_srm_profile_path: Optional[str] = None
     bullet_device_name: str = ""
@@ -42,12 +42,12 @@ class AdaptivePDMuxConfig(PDMuxConfig):
     bullet_tpot_slo_ms: float = 10.0
     bullet_tpot_headroom: float = 1.0
     bullet_prefill_layers_per_step: int = 4
-    bullet_online_calibration: bool = True
+    bullet_online_calibration: bool = False
     bullet_online_calibration_weight: float = 0.25
     muxwise_profile_path: Optional[str] = None
     muxwise_tbt_slo_ms: float = 50.0
     muxwise_tbt_headroom: float = 1.0
-    muxwise_online_guard_update: bool = True
+    muxwise_online_guard_update: bool = False
     muxwise_allow_sm_interpolation: bool = False
     profile_fixed_stream_idx: int = 1
     profile_observation_path: Optional[str] = None
@@ -120,9 +120,13 @@ def load_adaptive_pdmux_config(config_path: str) -> AdaptivePDMuxConfig:
             "dispatcher; custom policies require runtime_mode='improved'"
         )
 
-    repartition_interval_chunks = int(raw.get("repartition_interval_chunks", 0))
-    if repartition_interval_chunks < 0:
-        raise ValueError("repartition_interval_chunks must be >= 0")
+    legacy = raw.get("repartition_interval_chunks")
+    canonical = raw.get("reevaluate_every_prefill_layer_chunks", legacy if legacy is not None else 0)
+    if legacy is not None and int(canonical) != int(legacy):
+        raise ValueError("conflicting prefill layer chunk reevaluation intervals")
+    reevaluate_every_prefill_layer_chunks = int(canonical)
+    if reevaluate_every_prefill_layer_chunks < 0:
+        raise ValueError("reevaluate_every_prefill_layer_chunks must be >= 0")
 
     partition_transition = raw.get("partition_transition", "host_sync_always")
     if partition_transition not in {"host_sync_always", "host_sync", "event_handoff"}:
@@ -137,9 +141,13 @@ def load_adaptive_pdmux_config(config_path: str) -> AdaptivePDMuxConfig:
             "decode_graph_mode must be one of: per_partition, full_sm_once"
         )
 
-    mi_objective = raw.get("mi_objective", "latency")
-    if mi_objective not in {"latency", "energy", "edp"}:
-        raise ValueError("mi_objective must be one of: latency, energy, edp")
+    if "mi_objective" in raw:
+        raise ValueError("mi_objective was removed: Ours selects minimum decode SM within TPOT SLO")
+    mi_power_limit_w = raw.get("mi_power_limit_w")
+    if mi_power_limit_w is not None:
+        mi_power_limit_w = float(mi_power_limit_w)
+        if not 0 < mi_power_limit_w < float("inf"):
+            raise ValueError("mi_power_limit_w must be finite and positive")
     mi_frequency_value = os.environ.get(
         "SGLANG_PDMUX_MI_FREQUENCY_MHZ", raw.get("mi_frequency_mhz")
     )
@@ -148,6 +156,9 @@ def load_adaptive_pdmux_config(config_path: str) -> AdaptivePDMuxConfig:
     )
     if mi_frequency_mhz is not None and mi_frequency_mhz <= 0:
         raise ValueError("mi_frequency_mhz must be > 0")
+    mi_tpot_slo_ms = float(raw.get("mi_tpot_slo_ms", 10.0))
+    if not 0 < mi_tpot_slo_ms < float("inf"):
+        raise ValueError("mi_tpot_slo_ms must be finite and > 0")
 
     bullet_frequency_value = os.environ.get(
         "SGLANG_PDMUX_BULLET_FREQUENCY_MHZ",
@@ -232,7 +243,7 @@ def load_adaptive_pdmux_config(config_path: str) -> AdaptivePDMuxConfig:
         decode_bs_divisor=raw.get("decode_bs_divisor", 36),
         runtime_mode=runtime_mode,
         partition_policy=partition_policy,
-        repartition_interval_chunks=repartition_interval_chunks,
+        reevaluate_every_prefill_layer_chunks=reevaluate_every_prefill_layer_chunks,
         partition_transition=partition_transition,
         decode_graph_mode=decode_graph_mode,
         mi_path=resolve_config_path(
@@ -246,8 +257,8 @@ def load_adaptive_pdmux_config(config_path: str) -> AdaptivePDMuxConfig:
             "SGLANG_PDMUX_MI_DTYPE", raw.get("mi_dtype", "bf16")
         ),
         mi_frequency_mhz=mi_frequency_mhz,
-        mi_objective=mi_objective,
-        mi_allow_modeled_throttling=raw.get("mi_allow_modeled_throttling", True),
+        mi_tpot_slo_ms=mi_tpot_slo_ms,
+        mi_power_limit_w=mi_power_limit_w,
         mi_allow_extrapolation=raw.get("mi_allow_extrapolation", True),
         mi_calibration_path=resolve_config_path(raw.get("mi_calibration_path")),
         bullet_srm_profile_path=resolve_config_path(
@@ -268,7 +279,7 @@ def load_adaptive_pdmux_config(config_path: str) -> AdaptivePDMuxConfig:
         bullet_tpot_slo_ms=bullet_tpot_slo_ms,
         bullet_tpot_headroom=bullet_tpot_headroom,
         bullet_prefill_layers_per_step=bullet_prefill_layers_per_step,
-        bullet_online_calibration=raw.get("bullet_online_calibration", True),
+        bullet_online_calibration=raw.get("bullet_online_calibration", False),
         bullet_online_calibration_weight=bullet_online_calibration_weight,
         muxwise_profile_path=resolve_config_path(
             os.environ.get(
@@ -278,7 +289,7 @@ def load_adaptive_pdmux_config(config_path: str) -> AdaptivePDMuxConfig:
         ),
         muxwise_tbt_slo_ms=muxwise_tbt_slo_ms,
         muxwise_tbt_headroom=muxwise_tbt_headroom,
-        muxwise_online_guard_update=raw.get("muxwise_online_guard_update", True),
+        muxwise_online_guard_update=raw.get("muxwise_online_guard_update", False),
         muxwise_allow_sm_interpolation=raw.get("muxwise_allow_sm_interpolation", False),
         profile_fixed_stream_idx=profile_fixed_stream_idx,
         profile_observation_path=profile_observation_path,

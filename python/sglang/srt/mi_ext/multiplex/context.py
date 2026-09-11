@@ -14,18 +14,18 @@ if TYPE_CHECKING:
     from sglang.srt.multiplex.pdmux_context import PDMuxConfig
 
 # Retain the original GC streams for the lifetime of their priority siblings.
-OMNIDECODE_PREFILL_STREAM_OWNERS = []
+SM_OVERSUBSCRIPTION_PREFILL_STREAM_OWNERS = []
 PDMUX_CONCURRENCY_MODES = {"per_partition", "fixed_partition", "single_decode_graph"}
 
 
-def _omnidecode_prefill_stream(stream, gpu_id):
+def _sm_oversubscription_prefill_stream(stream, gpu_id):
     """Use the same GC resources with highest-priority eager prefill work."""
     from cuda.bindings import driver as cuda
 
     def checked(result):
         status, *values = result
         if status != cuda.CUresult.CUDA_SUCCESS:
-            raise RuntimeError(f"OmniDecode stream creation failed: {status}")
+            raise RuntimeError(f"SM oversubscription stream creation failed: {status}")
         return values
 
     _, highest = checked(cuda.cuCtxGetStreamPriorityRange())
@@ -35,7 +35,7 @@ def _omnidecode_prefill_stream(stream, gpu_id):
             green_ctx, int(cuda.CUstream_flags.CU_STREAM_NON_BLOCKING), highest
         )
     )
-    OMNIDECODE_PREFILL_STREAM_OWNERS.append(stream)
+    SM_OVERSUBSCRIPTION_PREFILL_STREAM_OWNERS.append(stream)
     return torch.cuda.get_stream_from_external(int(handle), device=gpu_id)
 
 
@@ -126,7 +126,7 @@ def configure_stream_groups(stream_groups, config, gpu_id):
     return [
         (
             (
-                _omnidecode_prefill_stream(prefill, gpu_id)
+                _sm_oversubscription_prefill_stream(prefill, gpu_id)
                 if 0 < index < len(stream_groups) - 1
                 else prefill
             ),
