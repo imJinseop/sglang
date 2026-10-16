@@ -70,7 +70,7 @@ class MIPDMuxPolicy:
             sys.path.insert(0, config.mi_path)
 
         try:
-            from bullet_green import (
+            from modeling.scheduling import (
                 ExecutionPlan,
                 ExecutionState,
                 MISGLangRuntimePredictor,
@@ -80,7 +80,7 @@ class MIPDMuxPolicy:
             location = config.mi_path or "the current Python path"
             raise ImportError(
                 "partition_policy='mi' requires the MI repository; "
-                f"could not import bullet_green from {location}"
+                f"could not import modeling.scheduling from {location}"
             ) from exc
 
         predictor = MISGLangRuntimePredictor.from_device_name(

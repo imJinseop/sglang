@@ -127,7 +127,9 @@ class LayerwiseGroundTruthRecorder:
             return value
 
     def _energy_mj(self) -> int:
-        return int(self._nvml.nvmlDeviceGetTotalEnergyConsumption(self._handle))
+        from utils.observer.queries import read_total_energy_mj
+
+        return int(read_total_energy_mj(self._handle, self._nvml))
 
     def _clock_mhz(self) -> int:
         return int(
