@@ -88,7 +88,10 @@ class SRMHardwareProfile:
         """
 
         from device import Device
-        from modeling.cost_model.throughput import BandwidthCurve, ComputeCurve
+        from modeling.cost_model.latency.model import (
+            bandwidth_curve_from_device, compute_curve_from_device, compute_rate,
+            saturation_bandwidth_Bps,
+        )
 
         mode = {
             "bf16": "bf16_tensor",
@@ -101,20 +104,21 @@ class SRMHardwareProfile:
         if mode is None:
             raise ValueError(f"unsupported dtype {dtype!r}")
         device = Device.load(device_name, device_dir)
-        compute = ComputeCurve.from_device(device, mode)
-        bandwidth = BandwidthCurve.from_device(device, "memcpy")
+        compute = compute_curve_from_device(device, mode)
+        bandwidth = bandwidth_curve_from_device(device, "memcpy")
         frequency = int(reference_frequency_mhz)
+        peak_bandwidth = saturation_bandwidth_Bps(bandwidth)
         return cls(
             device_name=device.name,
             total_sm=int(device.specification.num_sm),
             reference_frequency_mhz=frequency,
-            peak_compute_flops_s=compute.FLOPs_per_s(
-                frequency, device.specification.num_sm
+            peak_compute_flops_s=compute_rate(
+                compute, frequency, device.specification.num_sm
             ),
-            peak_memory_bandwidth_Bps=bandwidth.saturation_Bps,
+            peak_memory_bandwidth_Bps=peak_bandwidth,
             memory_saturation_sm=min(
                 float(device.specification.num_sm),
-                bandwidth.saturation_Bps / (bandwidth.slope_Bps_per_MHz_SM * frequency),
+                peak_bandwidth / (bandwidth.slope_Bps_per_MHz_SM * frequency),
             ),
             provenance="MI measured capacity curves; Bullet Eq. 1 reproduction",
         )

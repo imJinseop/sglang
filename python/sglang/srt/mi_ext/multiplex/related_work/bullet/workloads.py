@@ -23,7 +23,7 @@ def build_phase_layer_work(
 ) -> LaneWork:
     """Build one phase's per-kernel work even when the other lane is idle."""
 
-    from modeling.cost_model.execution_estimator.llm_composition import build_llm_workload
+    from modeling.cost_model.operation_count_estimator.llm_composition import build_llm_workload
 
     if phase == "prefill":
         if state.prefill_tokens <= 0 or state.prefill_batch <= 0:

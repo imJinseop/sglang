@@ -75,7 +75,7 @@ class MIPDMuxPolicy:
                 ExecutionState,
                 MISGLangRuntimePredictor,
             )
-            from modeling.cost_model.execution_estimator.model_spec import get_model_spec
+            from modeling.cost_model.operation_count_estimator.model_spec import get_model_spec
         except ImportError as exc:
             location = config.mi_path or "the current Python path"
             raise ImportError(
